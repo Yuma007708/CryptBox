@@ -1,0 +1,43 @@
+{
+  "name": "cryptbox",
+  "version": "0.1.0",
+  "description": "端末内で暗号化する大容量ファイル転送 (Cloudflare Workers + R2 + D1)",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yuma007708/CryptBox.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Yuma007708/CryptBox/issues"
+  },
+  "homepage": "https://github.com/Yuma007708/CryptBox#readme",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260901.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.1"
+  },
+  "dependencies": {
+    "hash-wasm": "^4.12.0",
+    "hono": "^4.13.5"
+  },
+  "scripts": {
+    "dev": "npm run build:web && wrangler dev",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
+    "test": "vitest run",
+    "deploy": "npm run build:web && wrangler deploy",
+    "db:init": "wrangler d1 execute cryptbox --remote --file=src/schema.sql",
+    "db:init:local": "wrangler d1 execute cryptbox --local --file=src/schema.sql"
+  }
+}
