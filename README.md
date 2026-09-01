@@ -1,7 +1,7 @@
 # CryptBox
 
 大容量ファイルを **端末内で暗号化してから** 送る、ギガファイル便ライクな転送サービス。
-Cloudflare Workers + R2 + D1 の上で動きます。
+Cloudflare Workers + R2 + D1 の上で動きます。アカウント登録は不要です。
 
 サーバー（および Cloudflare）が保持するのは **暗号文と一方向ハッシュだけ** です。
 復号鍵は URL の `#` より後ろ（フラグメント）に載るため、HTTP リクエストに含まれず
@@ -24,6 +24,7 @@ https://example.com/d/<43文字のトークン>#<復号鍵>
 | 有効期限 | 1 時間 / 24 時間 / 7 日 / 30 日 |
 | ダウンロード回数制限 | 1 / 5 / 20 / 100 / 無制限。D1 上で原子的にカウント |
 | パスワード付きファイル | リンク＋パスワードの二要素。どちらか一方だけでは復号不可 |
+| 複数ファイル | 1 リンクに最大 50 ファイル。受信側で個別／一括ダウンロード |
 | 自動削除 | Cron Trigger（10 分間隔）で期限切れ・回数超過を R2 ごと削除 |
 | 画質の劣化ゼロ | 再エンコードなし。詳細は下記 |
 
@@ -41,18 +42,35 @@ SHA-256 が完全一致することを検証しています。
 > R2 のオブジェクトにも Worker のレスポンスにも適用していません
 > （そもそも `application/octet-stream` の暗号文です）。
 
+## 画面
+
+| 画面 | 内容 |
+| --- | --- |
+| ファイルを送る (`/`) | ドラッグ＆ドロップ、選択中のファイル一覧、オプション設定（有効期限・ダウンロード回数・パスワード保護）、最近の送信 |
+| 送信履歴 (`/history`) | 発行済みリンクの一覧。リンクのコピーと、サーバーからの即時削除 |
+| 設定 (`/settings`) | テーマ（ライト／ダーク／OS 追従）、送信時の既定値、履歴の保存可否 |
+| ヘルプ (`/help`) | しくみと注意点 |
+| 受信 (`/d/<token>#<鍵>`) | ファイル一覧、パスワード入力、復号ダウンロード |
+
+送信履歴と設定は **この端末の localStorage にだけ** 保存されます。サーバーには残りません。
+履歴には復号鍵を含むリンクが入るため、共有端末では設定からオフにできます。
+
 ## 暗号設計
 
 ```
 linkSecret  = 32 バイトの乱数                    ← URL の #（サーバーに送られない）
 pwKey       = Argon2id(password, pwSalt)         ← パスワード指定時のみ
 KEK         = HKDF-SHA256(linkSecret ‖ pwKey, salt=kdfSalt, info="cryptbox/v1/kek")
-CEK         = 32 バイトの乱数                    ← ファイル本体の鍵
-wrappedCEK  = AES-256-GCM(KEK, CEK)              ← これだけがサーバーに保存される
+CEK[i]      = 32 バイトの乱数                    ← ファイルごとに独立した鍵
+wrappedCEK  = AES-256-GCM(KEK, CEK[i])           ← これだけがサーバーに保存される
 
 authToken   = HKDF(linkSecret, info="…/auth")    ← サーバーは SHA-256 だけを保持
 pwVerifier  = HKDF(pwKey,      info="…/verify")  ← 同上
 ```
+
+1 リンク（バンドル）に複数ファイルを入れても、**ファイルごとに別の CEK** を使います。
+同じ鍵で nonce が衝突する余地をなくすためです。KEK はバンドルで 1 つなので、
+パスワード入力（Argon2id）は何ファイルあっても 1 回で済みます。
 
 本体は 16 MiB の平文チャンクごとに独立して暗号化します。
 
@@ -75,7 +93,7 @@ pwVerifier  = HKDF(pwKey,      info="…/verify")  ← 同上
 
 | | 方式 |
 | --- | --- |
-| アップロード | 16 MiB チャンクを 3 並列で送信 → R2 マルチパートアップロード（最大 10,000 パート ≒ 156 GiB）。失敗したチャンクだけ指数バックオフで再送 |
+| アップロード | 16 MiB チャンクを 3 並列で送信 → R2 マルチパートアップロード（1 ファイルあたり最大 10,000 パート ≒ 156 GiB）。失敗したチャンクだけ指数バックオフで再送 |
 | ダウンロード | 1 本のレスポンスを読みながらチャンク境界で復号。切断されたら **最後に復号し終えた位置から Range で再開** |
 | 保存先 | ① File System Access API（Chromium：直接ファイルへ書き込み） → ② Service Worker ストリーム（Firefox / Safari） → ③ Blob（最終手段） |
 
@@ -84,19 +102,35 @@ pwVerifier  = HKDF(pwKey,      info="…/verify")  ← 同上
 ## 構成
 
 ```
-shared/format.ts   暗号フォーマットの定義（Worker とブラウザで共有）
-src/               Cloudflare Worker（Hono）
-  index.ts         API・アセット配信・Cron による自動削除
-  schema.sql       D1 スキーマ
-web/               フロントエンド（Vite / TypeScript、フレームワークなし）
-  src/crypto.ts    鍵導出・暗号化
-  src/upload.ts    チャンク分割アップロード
-  src/download.ts  ストリーム復号（再開つき）
-  src/saver.ts     保存方式のフォールバック
-  public/sw.js     ストリーム保存用 Service Worker
-test/              Vitest（Worker 結合テスト / 暗号ユニットテスト）
-docs/              デプロイ手順・脅威モデル
+shared/format.ts     暗号フォーマットの定義（Worker とブラウザで共有）
+src/                 Cloudflare Worker（Hono）
+  index.ts           API・アセット配信・Cron による自動削除
+  schema.sql         D1 スキーマ（bundles / bundle_files / uploads …）
+web/                 フロントエンド（Vite / TypeScript、フレームワークなし）
+  src/crypto.ts      鍵導出・暗号化
+  src/upload.ts      複数ファイルのチャンク分割アップロード
+  src/download.ts    ストリーム復号（再開つき）
+  src/saver.ts       保存方式のフォールバック
+  src/history.ts     送信履歴（localStorage）
+  src/settings.ts    設定とテーマ
+  src/views/         画面（送る / 履歴 / 設定 / ヘルプ / 受信）
+  public/sw.js       ストリーム保存用 Service Worker
+test/                Vitest（Worker 結合テスト / 暗号ユニットテスト）
+docs/                デプロイ手順・脅威モデル
 ```
+
+## API
+
+| メソッド | パス | 用途 |
+| --- | --- | --- |
+| POST | `/api/uploads` | セッション作成（ファイル数とサイズを申告） |
+| PUT | `/api/uploads/:token/files/:file/parts/:chunk` | 暗号化済みチャンクの送信 |
+| POST | `/api/uploads/:token/complete` | マルチパート確定 + 共有トークン発行 |
+| DELETE | `/api/uploads/:token` | 中断（R2 のマルチパートも中止） |
+| POST | `/api/files/:token/info` | メタデータ取得（要 authToken） |
+| POST | `/api/files/:token/claim` | ダウンロード回数を 1 消費してグラント取得 |
+| GET | `/api/files/:token/files/:file/blob` | 暗号文の取得（Range 対応） |
+| DELETE | `/api/files/:token` | 即時削除 |
 
 ## セットアップ
 
@@ -131,7 +165,7 @@ npm run dev                      # http://127.0.0.1:8787
 ### テスト
 
 ```bash
-npm test        # Worker 結合テスト + 暗号テスト（31 件）
+npm test        # Worker 結合テスト + 暗号テスト（35 件）
 npm run typecheck
 ```
 
@@ -146,7 +180,9 @@ npm run typecheck
 
 ## 現時点で入っていないもの
 
+- アカウント機能（サインイン・受信トレイ・サーバー保存の履歴）。
+  本アプリは匿名リンク方式で、送信履歴は端末内にのみ保持します
 - レート制限（トークンは 256 bit なので総当たりは非現実的ですが、
   アップロード濫用対策には Cloudflare の Rate Limiting ルールの併用を推奨）
-- 複数ファイルの一括送信（ZIP 化）
+- 受信側での ZIP 一括保存（現状は 1 リンクから個別に保存します）
 - ウイルススキャン（サーバー側で中身を見られないため、原理的に不可）

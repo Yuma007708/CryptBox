@@ -16,6 +16,7 @@ import {
   GCM_TAG_BYTES,
   KDF_SALT_BYTES,
   MAX_EXPIRY_SECONDS,
+  MAX_FILES_PER_BUNDLE,
   NONCE_BYTES,
   NONCE_PREFIX_BYTES,
   PW_SALT_BYTES,
@@ -33,34 +34,14 @@ const MAX_PARTS = 10000;
 const app = new Hono<{ Bindings: Env }>();
 
 /* ------------------------------------------------------------------ *
- * 共通ミドルウェア
+ * 共通
  * ------------------------------------------------------------------ */
 
-app.use('*', async (c, next) => {
+app.use('/api/*', async (c, next) => {
   await next();
-  const headers = c.res.headers;
-  headers.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
-  headers.set('X-Content-Type-Options', 'nosniff');
-  headers.set('Referrer-Policy', 'no-referrer');
-  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-  headers.set('Permissions-Policy', 'interest-cohort=(), geolocation=(), camera=(), microphone=()');
-  if (headers.get('content-type')?.includes('text/html')) {
-    headers.set(
-      'Content-Security-Policy',
-      [
-        "default-src 'self'",
-        // hash-wasm (Argon2id) を動かすため WASM のコンパイルのみ許可する
-        "script-src 'self' 'wasm-unsafe-eval'",
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data:",
-        "connect-src 'self'",
-        "worker-src 'self'",
-        "base-uri 'none'",
-        "form-action 'none'",
-        "frame-ancestors 'none'",
-      ].join('; '),
-    );
-  }
+  c.res.headers.set('Cache-Control', 'no-store');
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('Referrer-Policy', 'no-referrer');
 });
 
 app.onError((err, c) => {
@@ -68,6 +49,17 @@ app.onError((err, c) => {
   console.error('unhandled error', err);
   return c.json({ error: 'サーバー内部エラー' }, 500);
 });
+
+class NotFound extends Error {}
+class Gone extends Error {}
+
+function errorResponse(err: unknown): Response | null {
+  if (err instanceof NotFound) {
+    return Response.json({ error: 'ファイルが見つかりません' }, { status: 404 });
+  }
+  if (err instanceof Gone) return Response.json({ error: err.message }, { status: 410 });
+  return null;
+}
 
 /** アップロード API を閉じたい場合は UPLOAD_TOKEN を設定する */
 function assertUploadAllowed(c: { req: { header: (name: string) => string | undefined }; env: Env }) {
@@ -102,49 +94,81 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
 
 interface UploadRow {
   id: string;
+  chunk_size: number;
+  file_count: number;
+}
+
+interface UploadFileRow {
+  file_index: number;
   r2_key: string;
   r2_upload_id: string;
   plain_size: number;
-  chunk_size: number;
   total_chunks: number;
 }
 
 app.post('/api/uploads', async (c) => {
   assertUploadAllowed(c);
   const body = await readJson(c.req.raw);
-  const plainSize = requireInt(body.plainSize, 'plainSize');
   const chunkSize = requireInt(body.chunkSize, 'chunkSize');
-
   if (chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE) {
     throw new BadRequest('chunkSize が許容範囲外です');
   }
-  const limit = maxFileSize(c.env);
-  if (plainSize > limit) {
-    throw new BadRequest(`ファイルが大きすぎます (上限 ${limit} バイト)`);
+
+  if (!Array.isArray(body.files) || body.files.length === 0) {
+    throw new BadRequest('files が空です');
   }
-  const chunks = computeChunks(plainSize, chunkSize);
-  if (chunks > MAX_PARTS) throw new BadRequest('チャンク数が多すぎます');
+  if (body.files.length > MAX_FILES_PER_BUNDLE) {
+    throw new BadRequest(`1 度に送れるのは ${MAX_FILES_PER_BUNDLE} ファイルまでです`);
+  }
+
+  const limit = maxFileSize(c.env);
+  const sizes = body.files.map((file, index) => {
+    if (typeof file !== 'object' || file === null) throw new BadRequest('files が不正です');
+    return requireInt((file as Record<string, unknown>).plainSize, `files[${index}].plainSize`);
+  });
+  const totalSize = sizes.reduce((sum, size) => sum + size, 0);
+  if (totalSize > limit) throw new BadRequest(`合計サイズが大きすぎます (上限 ${limit} バイト)`);
+
+  const chunkCounts = sizes.map((size) => {
+    const chunks = computeChunks(size, chunkSize);
+    if (chunks > MAX_PARTS) throw new BadRequest('チャンク数が多すぎます');
+    return chunks;
+  });
 
   const uploadToken = toBase64Url(randomBytes(32));
   const id = await sha256Hex(uploadToken);
-  const r2Key = `blob/${toBase64Url(randomBytes(24))}`;
-  const multipart = await c.env.BUCKET.createMultipartUpload(r2Key);
   const now = Date.now();
 
-  await c.env.DB.prepare(
-    `INSERT INTO uploads (id, r2_key, r2_upload_id, created_at, abandon_at, plain_size, chunk_size, total_chunks)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(id, r2Key, multipart.uploadId, now, now + UPLOAD_TTL_MS, plainSize, chunkSize, chunks)
-    .run();
+  const statements = [
+    c.env.DB.prepare(
+      `INSERT INTO uploads (id, created_at, abandon_at, chunk_size, file_count)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).bind(id, now, now + UPLOAD_TTL_MS, chunkSize, sizes.length),
+  ];
 
-  return c.json({ uploadToken, totalChunks: chunks, chunkSize });
+  for (let index = 0; index < sizes.length; index++) {
+    const r2Key = `blob/${toBase64Url(randomBytes(24))}`;
+    const multipart = await c.env.BUCKET.createMultipartUpload(r2Key);
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO upload_files (upload_id, file_index, r2_key, r2_upload_id, plain_size, total_chunks)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(id, index, r2Key, multipart.uploadId, sizes[index], chunkCounts[index]),
+    );
+  }
+  await c.env.DB.batch(statements);
+
+  return c.json({
+    uploadToken,
+    chunkSize,
+    files: chunkCounts.map((chunks, index) => ({ index, totalChunks: chunks })),
+  });
 });
 
 async function loadUpload(env: Env, uploadToken: string): Promise<UploadRow> {
   const id = await sha256Hex(uploadToken);
   const row = await env.DB.prepare(
-    `SELECT id, r2_key, r2_upload_id, plain_size, chunk_size, total_chunks FROM uploads WHERE id = ?`,
+    `SELECT id, chunk_size, file_count FROM uploads WHERE id = ?`,
   )
     .bind(id)
     .first<UploadRow>();
@@ -152,37 +176,76 @@ async function loadUpload(env: Env, uploadToken: string): Promise<UploadRow> {
   return row;
 }
 
-app.put('/api/uploads/:token/parts/:index', async (c) => {
+async function loadUploadFile(env: Env, uploadId: string, index: number): Promise<UploadFileRow> {
+  const row = await env.DB.prepare(
+    `SELECT file_index, r2_key, r2_upload_id, plain_size, total_chunks
+       FROM upload_files WHERE upload_id = ? AND file_index = ?`,
+  )
+    .bind(uploadId, index)
+    .first<UploadFileRow>();
+  if (!row) throw new BadRequest('ファイル番号が不正です');
+  return row;
+}
+
+app.put('/api/uploads/:token/files/:file/parts/:chunk', async (c) => {
   assertUploadAllowed(c);
   const upload = await loadUpload(c.env, c.req.param('token'));
-  const index = Number(c.req.param('index'));
-  if (!Number.isInteger(index) || index < 0 || index >= upload.total_chunks) {
+  const fileIndex = Number(c.req.param('file'));
+  if (!Number.isInteger(fileIndex) || fileIndex < 0 || fileIndex >= upload.file_count) {
+    throw new BadRequest('ファイル番号が不正です');
+  }
+  const file = await loadUploadFile(c.env, upload.id, fileIndex);
+
+  const chunkIndex = Number(c.req.param('chunk'));
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= file.total_chunks) {
     throw new BadRequest('チャンク番号が不正です');
   }
   if (!c.req.raw.body) throw new BadRequest('ボディがありません');
 
-  const isLast = index === upload.total_chunks - 1;
+  const isLast = chunkIndex === file.total_chunks - 1;
   const expected = isLast
-    ? upload.plain_size - index * upload.chunk_size + GCM_TAG_BYTES
+    ? file.plain_size - chunkIndex * upload.chunk_size + GCM_TAG_BYTES
     : upload.chunk_size + GCM_TAG_BYTES;
   const declared = Number(c.req.header('content-length'));
   if (Number.isFinite(declared) && declared !== expected) {
     throw new BadRequest('チャンクの長さが不正です');
   }
 
-  const multipart = c.env.BUCKET.resumeMultipartUpload(upload.r2_key, upload.r2_upload_id);
+  const multipart = c.env.BUCKET.resumeMultipartUpload(file.r2_key, file.r2_upload_id);
   // R2 のパート番号は 1 始まり
-  const part = await multipart.uploadPart(index + 1, c.req.raw.body);
+  const part = await multipart.uploadPart(chunkIndex + 1, c.req.raw.body);
 
   await c.env.DB.prepare(
-    `INSERT INTO upload_parts (upload_id, part_number, etag) VALUES (?, ?, ?)
-     ON CONFLICT (upload_id, part_number) DO UPDATE SET etag = excluded.etag`,
+    `INSERT INTO upload_parts (upload_id, file_index, part_number, etag) VALUES (?, ?, ?, ?)
+     ON CONFLICT (upload_id, file_index, part_number) DO UPDATE SET etag = excluded.etag`,
   )
-    .bind(upload.id, part.partNumber, part.etag)
+    .bind(upload.id, fileIndex, part.partNumber, part.etag)
     .run();
 
-  return c.json({ index, etag: part.etag });
+  return c.json({ fileIndex, chunkIndex, etag: part.etag });
 });
+
+/** complete で受け取る、ファイルごとの暗号メタデータを検証する */
+function validateFileMeta(value: unknown, index: number): Record<string, string> {
+  if (typeof value !== 'object' || value === null) throw new BadRequest(`files[${index}] が不正です`);
+  const meta = value as Record<string, unknown>;
+  decodeFixed(meta.noncePrefix, NONCE_PREFIX_BYTES, `files[${index}].noncePrefix`);
+  decodeFixed(meta.wrapNonce, NONCE_BYTES, `files[${index}].wrapNonce`);
+  decodeFixed(meta.metaNonce, NONCE_BYTES, `files[${index}].metaNonce`);
+  if (typeof meta.wrappedCek !== 'string' || meta.wrappedCek.length > 512) {
+    throw new BadRequest(`files[${index}].wrappedCek が不正です`);
+  }
+  if (typeof meta.metaCipher !== 'string' || meta.metaCipher.length > 8192) {
+    throw new BadRequest(`files[${index}].metaCipher が不正です`);
+  }
+  return {
+    noncePrefix: meta.noncePrefix as string,
+    wrapNonce: meta.wrapNonce as string,
+    metaNonce: meta.metaNonce as string,
+    wrappedCek: meta.wrappedCek,
+    metaCipher: meta.metaCipher,
+  };
+}
 
 app.post('/api/uploads/:token/complete', async (c) => {
   assertUploadAllowed(c);
@@ -199,8 +262,8 @@ app.post('/api/uploads/:token/complete', async (c) => {
   }
 
   // 鍵素材そのものではなく、その一方向ハッシュのみを受け取る
-  const authHash = body.authHash;
-  if (!isHash(authHash)) throw new BadRequest('authHash が不正です');
+  if (!isHash(body.authHash)) throw new BadRequest('authHash が不正です');
+  decodeFixed(body.kdfSalt, KDF_SALT_BYTES, 'kdfSalt');
 
   const hasPassword = body.hasPassword === true;
   let pwSalt: string | null = null;
@@ -217,83 +280,123 @@ app.post('/api/uploads/:token/complete', async (c) => {
     pwParams = JSON.stringify(body.pwParams);
   }
 
-  decodeFixed(body.noncePrefix, NONCE_PREFIX_BYTES, 'noncePrefix');
-  decodeFixed(body.kdfSalt, KDF_SALT_BYTES, 'kdfSalt');
-  decodeFixed(body.wrapNonce, NONCE_BYTES, 'wrapNonce');
-  decodeFixed(body.metaNonce, NONCE_BYTES, 'metaNonce');
-  if (typeof body.wrappedCek !== 'string' || body.wrappedCek.length > 512) {
-    throw new BadRequest('wrappedCek が不正です');
+  if (!Array.isArray(body.files) || body.files.length !== upload.file_count) {
+    throw new BadRequest('files の数が一致しません');
   }
-  if (typeof body.metaCipher !== 'string' || body.metaCipher.length > 8192) {
-    throw new BadRequest('metaCipher が不正です');
-  }
+  const fileMetas = body.files.map(validateFileMeta);
 
-  // すべてのパートが揃っているか確認する
-  const parts = await c.env.DB.prepare(
-    `SELECT part_number, etag FROM upload_parts WHERE upload_id = ? ORDER BY part_number`,
+  const uploadFiles = await c.env.DB.prepare(
+    `SELECT file_index, r2_key, r2_upload_id, plain_size, total_chunks
+       FROM upload_files WHERE upload_id = ? ORDER BY file_index`,
   )
     .bind(upload.id)
-    .all<{ part_number: number; etag: string }>();
-  if (parts.results.length !== upload.total_chunks) {
-    throw new BadRequest(
-      `未送信のチャンクがあります (${parts.results.length}/${upload.total_chunks})`,
+    .all<UploadFileRow>();
+
+  const parts = await c.env.DB.prepare(
+    `SELECT file_index, part_number, etag FROM upload_parts
+      WHERE upload_id = ? ORDER BY file_index, part_number`,
+  )
+    .bind(upload.id)
+    .all<{ file_index: number; part_number: number; etag: string }>();
+
+  // すべてのパートが揃っているか確認してから R2 のマルチパートを確定する
+  for (const file of uploadFiles.results) {
+    const uploaded = parts.results.filter((part) => part.file_index === file.file_index);
+    if (uploaded.length !== file.total_chunks) {
+      throw new BadRequest(
+        `未送信のチャンクがあります (ファイル ${file.file_index}: ${uploaded.length}/${file.total_chunks})`,
+      );
+    }
+  }
+
+  for (const file of uploadFiles.results) {
+    const uploaded = parts.results.filter((part) => part.file_index === file.file_index);
+    const multipart = c.env.BUCKET.resumeMultipartUpload(file.r2_key, file.r2_upload_id);
+    await multipart.complete(
+      uploaded.map((part) => ({ partNumber: part.part_number, etag: part.etag })),
     );
   }
 
-  const multipart = c.env.BUCKET.resumeMultipartUpload(upload.r2_key, upload.r2_upload_id);
-  await multipart.complete(
-    parts.results.map((p) => ({ partNumber: p.part_number, etag: p.etag })),
-  );
-
-  const fileToken = toBase64Url(randomBytes(FILE_TOKEN_BYTES));
-  const fileId = await sha256Hex(fileToken);
+  const shareToken = toBase64Url(randomBytes(FILE_TOKEN_BYTES));
+  const bundleId = await sha256Hex(shareToken);
   const now = Date.now();
   const expiresAt = now + expiresIn * 1000;
-  const cipherSize = cipherTotalSize(upload.plain_size, upload.chunk_size);
+  const totalPlainSize = uploadFiles.results.reduce((sum, file) => sum + file.plain_size, 0);
 
-  await c.env.DB.batch([
+  const statements = [
     c.env.DB.prepare(
-      `INSERT INTO files (
-         id, r2_key, created_at, expires_at, max_downloads, download_count,
-         plain_size, cipher_size, chunk_size, total_chunks, nonce_prefix,
-         kdf_salt, wrapped_cek, wrap_nonce, meta_cipher, meta_nonce,
-         auth_hash, has_password, pw_salt, pw_params, pw_hash
-       ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO bundles (
+         id, created_at, expires_at, max_downloads, download_count, file_count, total_plain_size,
+         kdf_salt, auth_hash, has_password, pw_salt, pw_params, pw_hash
+       ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
-      fileId,
-      upload.r2_key,
+      bundleId,
       now,
       expiresAt,
       maxDownloads,
-      upload.plain_size,
-      cipherSize,
-      upload.chunk_size,
-      upload.total_chunks,
-      body.noncePrefix as string,
+      uploadFiles.results.length,
+      totalPlainSize,
       body.kdfSalt as string,
-      body.wrappedCek,
-      body.wrapNonce as string,
-      body.metaCipher,
-      body.metaNonce as string,
-      authHash,
+      body.authHash,
       hasPassword ? 1 : 0,
       pwSalt,
       pwParams,
       pwHash,
     ),
-    c.env.DB.prepare(`DELETE FROM upload_parts WHERE upload_id = ?`).bind(upload.id),
-    c.env.DB.prepare(`DELETE FROM uploads WHERE id = ?`).bind(upload.id),
-  ]);
+  ];
 
-  return c.json({ token: fileToken, expiresAt, maxDownloads });
+  for (const file of uploadFiles.results) {
+    const meta = fileMetas[file.file_index]!;
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO bundle_files (
+           bundle_id, file_index, r2_key, plain_size, cipher_size, chunk_size, total_chunks,
+           nonce_prefix, wrapped_cek, wrap_nonce, meta_cipher, meta_nonce
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        bundleId,
+        file.file_index,
+        file.r2_key,
+        file.plain_size,
+        cipherTotalSize(file.plain_size, upload.chunk_size),
+        upload.chunk_size,
+        file.total_chunks,
+        meta.noncePrefix,
+        meta.wrappedCek,
+        meta.wrapNonce,
+        meta.metaCipher,
+        meta.metaNonce,
+      ),
+    );
+  }
+
+  statements.push(
+    c.env.DB.prepare(`DELETE FROM upload_parts WHERE upload_id = ?`).bind(upload.id),
+    c.env.DB.prepare(`DELETE FROM upload_files WHERE upload_id = ?`).bind(upload.id),
+    c.env.DB.prepare(`DELETE FROM uploads WHERE id = ?`).bind(upload.id),
+  );
+  await c.env.DB.batch(statements);
+
+  return c.json({ token: shareToken, expiresAt, maxDownloads });
 });
 
 app.delete('/api/uploads/:token', async (c) => {
   const upload = await loadUpload(c.env, c.req.param('token'));
-  const multipart = c.env.BUCKET.resumeMultipartUpload(upload.r2_key, upload.r2_upload_id);
-  await multipart.abort().catch(() => undefined);
+  const files = await c.env.DB.prepare(
+    `SELECT file_index, r2_key, r2_upload_id, plain_size, total_chunks
+       FROM upload_files WHERE upload_id = ?`,
+  )
+    .bind(upload.id)
+    .all<UploadFileRow>();
+
+  for (const file of files.results) {
+    await c.env.BUCKET.resumeMultipartUpload(file.r2_key, file.r2_upload_id)
+      .abort()
+      .catch(() => undefined);
+  }
   await c.env.DB.batch([
     c.env.DB.prepare(`DELETE FROM upload_parts WHERE upload_id = ?`).bind(upload.id),
+    c.env.DB.prepare(`DELETE FROM upload_files WHERE upload_id = ?`).bind(upload.id),
     c.env.DB.prepare(`DELETE FROM uploads WHERE id = ?`).bind(upload.id),
   ]);
   return c.json({ ok: true });
@@ -303,23 +406,15 @@ app.delete('/api/uploads/:token', async (c) => {
  * ダウンロード
  * ------------------------------------------------------------------ */
 
-interface FileRow {
+interface BundleRow {
   id: string;
-  r2_key: string;
   created_at: number;
   expires_at: number;
   max_downloads: number | null;
   download_count: number;
-  plain_size: number;
-  cipher_size: number;
-  chunk_size: number;
-  total_chunks: number;
-  nonce_prefix: string;
+  file_count: number;
+  total_plain_size: number;
   kdf_salt: string;
-  wrapped_cek: string;
-  wrap_nonce: string;
-  meta_cipher: string;
-  meta_nonce: string;
   auth_hash: string;
   has_password: number;
   pw_salt: string | null;
@@ -327,13 +422,28 @@ interface FileRow {
   pw_hash: string | null;
 }
 
+interface BundleFileRow {
+  file_index: number;
+  r2_key: string;
+  plain_size: number;
+  cipher_size: number;
+  chunk_size: number;
+  total_chunks: number;
+  nonce_prefix: string;
+  wrapped_cek: string;
+  wrap_nonce: string;
+  meta_cipher: string;
+  meta_nonce: string;
+}
+
 /**
- * リンクトークンとファイル固有の authToken の両方を検証する。
- * どちらも URL フラグメント由来なので、リンクを知らない第三者は到達できない。
+ * 共有トークンと authToken の両方を検証する。
+ * どちらも URL 由来だが、authToken はフラグメントの鍵からしか作れないため、
+ * アクセスログにトークンが残っても第三者は API を叩けない。
  */
-async function authorize(env: Env, token: string, authToken: unknown): Promise<FileRow> {
+async function authorize(env: Env, token: string, authToken: unknown): Promise<BundleRow> {
   const id = await sha256Hex(token);
-  const row = await env.DB.prepare(`SELECT * FROM files WHERE id = ?`).bind(id).first<FileRow>();
+  const row = await env.DB.prepare(`SELECT * FROM bundles WHERE id = ?`).bind(id).first<BundleRow>();
   if (!row) throw new NotFound();
   if (typeof authToken !== 'string') throw new NotFound();
   let presented: string;
@@ -347,24 +457,11 @@ async function authorize(env: Env, token: string, authToken: unknown): Promise<F
   return row;
 }
 
-class NotFound extends Error {}
-class Gone extends Error {}
-
-function errorResponse(err: unknown): Response | null {
-  if (err instanceof NotFound) {
-    return Response.json({ error: 'ファイルが見つかりません' }, { status: 404 });
-  }
-  if (err instanceof Gone) {
-    return Response.json({ error: err.message }, { status: 410 });
-  }
-  return null;
-}
-
 app.post('/api/files/:token/info', async (c) => {
   const body = await readJson(c.req.raw);
-  let row: FileRow;
+  let bundle: BundleRow;
   try {
-    row = await authorize(c.env, c.req.param('token'), body.authToken);
+    bundle = await authorize(c.env, c.req.param('token'), body.authToken);
   } catch (err) {
     const res = errorResponse(err);
     if (res) return res;
@@ -372,34 +469,49 @@ app.post('/api/files/:token/info', async (c) => {
   }
 
   const remaining =
-    row.max_downloads === null ? null : Math.max(0, row.max_downloads - row.download_count);
+    bundle.max_downloads === null
+      ? null
+      : Math.max(0, bundle.max_downloads - bundle.download_count);
   if (remaining === 0) return c.json({ error: 'ダウンロード回数の上限に達しています' }, 410);
 
+  const files = await c.env.DB.prepare(
+    `SELECT file_index, plain_size, cipher_size, chunk_size, total_chunks,
+            nonce_prefix, wrapped_cek, wrap_nonce, meta_cipher, meta_nonce
+       FROM bundle_files WHERE bundle_id = ? ORDER BY file_index`,
+  )
+    .bind(bundle.id)
+    .all<BundleFileRow>();
+
   return c.json({
-    plainSize: row.plain_size,
-    cipherSize: row.cipher_size,
-    chunkSize: row.chunk_size,
-    totalChunks: row.total_chunks,
-    noncePrefix: row.nonce_prefix,
-    kdfSalt: row.kdf_salt,
-    wrappedCek: row.wrapped_cek,
-    wrapNonce: row.wrap_nonce,
-    metaCipher: row.meta_cipher,
-    metaNonce: row.meta_nonce,
-    hasPassword: row.has_password === 1,
-    pwSalt: row.pw_salt,
-    pwParams: row.pw_params ? JSON.parse(row.pw_params) : null,
-    expiresAt: row.expires_at,
-    maxDownloads: row.max_downloads,
+    createdAt: bundle.created_at,
+    expiresAt: bundle.expires_at,
+    maxDownloads: bundle.max_downloads,
     remainingDownloads: remaining,
+    totalPlainSize: bundle.total_plain_size,
+    kdfSalt: bundle.kdf_salt,
+    hasPassword: bundle.has_password === 1,
+    pwSalt: bundle.pw_salt,
+    pwParams: bundle.pw_params ? JSON.parse(bundle.pw_params) : null,
+    files: files.results.map((file) => ({
+      index: file.file_index,
+      plainSize: file.plain_size,
+      cipherSize: file.cipher_size,
+      chunkSize: file.chunk_size,
+      totalChunks: file.total_chunks,
+      noncePrefix: file.nonce_prefix,
+      wrappedCek: file.wrapped_cek,
+      wrapNonce: file.wrap_nonce,
+      metaCipher: file.meta_cipher,
+      metaNonce: file.meta_nonce,
+    })),
   });
 });
 
 app.post('/api/files/:token/claim', async (c) => {
   const body = await readJson(c.req.raw);
-  let row: FileRow;
+  let bundle: BundleRow;
   try {
-    row = await authorize(c.env, c.req.param('token'), body.authToken);
+    bundle = await authorize(c.env, c.req.param('token'), body.authToken);
   } catch (err) {
     const res = errorResponse(err);
     if (res) return res;
@@ -408,7 +520,7 @@ app.post('/api/files/:token/claim', async (c) => {
 
   // パスワードは Argon2id で導出した検証値のハッシュで確認する。
   // 誤入力ではダウンロード回数を消費しない。
-  if (row.has_password === 1) {
+  if (bundle.has_password === 1) {
     if (typeof body.pwVerifier !== 'string') {
       return c.json({ error: 'パスワードが必要です' }, 401);
     }
@@ -418,45 +530,52 @@ app.post('/api/files/:token/claim', async (c) => {
     } catch {
       return c.json({ error: 'パスワードが違います' }, 401);
     }
-    if (!timingSafeEqual(presented, row.pw_hash ?? '')) {
+    if (!timingSafeEqual(presented, bundle.pw_hash ?? '')) {
       return c.json({ error: 'パスワードが違います' }, 401);
     }
   }
 
   const now = Date.now();
   const claimed = await c.env.DB.prepare(
-    `UPDATE files
+    `UPDATE bundles
         SET download_count = download_count + 1, last_claim_at = ?
       WHERE id = ?
         AND expires_at > ?
         AND (max_downloads IS NULL OR download_count < max_downloads)`,
   )
-    .bind(now, row.id, now)
+    .bind(now, bundle.id, now)
     .run();
 
   if (!claimed.meta.changes) {
     return c.json({ error: 'ダウンロード回数の上限に達しています' }, 410);
   }
 
-  const expiresAt = Math.min(now + GRANT_TTL_MS, row.expires_at);
-  const grant = await signGrant(c.env.GRANT_SECRET, row.id, expiresAt);
+  const expiresAt = Math.min(now + GRANT_TTL_MS, bundle.expires_at);
+  const grant = await signGrant(c.env.GRANT_SECRET, bundle.id, expiresAt);
   const remaining =
-    row.max_downloads === null ? null : Math.max(0, row.max_downloads - row.download_count - 1);
+    bundle.max_downloads === null
+      ? null
+      : Math.max(0, bundle.max_downloads - bundle.download_count - 1);
 
   return c.json({ grant, grantExpiresAt: expiresAt, remainingDownloads: remaining });
 });
 
-app.get('/api/files/:token/blob', async (c) => {
-  const id = await sha256Hex(c.req.param('token'));
+app.get('/api/files/:token/files/:file/blob', async (c) => {
+  const bundleId = await sha256Hex(c.req.param('token'));
   const grant = c.req.query('g') ?? '';
-  if (!(await verifyGrant(c.env.GRANT_SECRET, grant, id, Date.now()))) {
+  if (!(await verifyGrant(c.env.GRANT_SECRET, grant, bundleId, Date.now()))) {
     return c.json({ error: 'ダウンロード権限がありません' }, 403);
   }
 
+  const fileIndex = Number(c.req.param('file'));
+  if (!Number.isInteger(fileIndex) || fileIndex < 0) {
+    return c.json({ error: 'ファイル番号が不正です' }, 400);
+  }
+
   const row = await c.env.DB.prepare(
-    `SELECT r2_key, cipher_size FROM files WHERE id = ?`,
+    `SELECT r2_key, cipher_size FROM bundle_files WHERE bundle_id = ? AND file_index = ?`,
   )
-    .bind(id)
+    .bind(bundleId, fileIndex)
     .first<{ r2_key: string; cipher_size: number }>();
   if (!row) return c.json({ error: 'ファイルが見つかりません' }, 404);
 
@@ -491,18 +610,30 @@ app.get('/api/files/:token/blob', async (c) => {
 /** 送信者・受信者いずれも、リンクを知っていれば即時削除できる */
 app.delete('/api/files/:token', async (c) => {
   const body = await readJson(c.req.raw);
-  let row: FileRow;
+  let bundle: BundleRow;
   try {
-    row = await authorize(c.env, c.req.param('token'), body.authToken);
+    bundle = await authorize(c.env, c.req.param('token'), body.authToken);
   } catch (err) {
     const res = errorResponse(err);
     if (res) return res;
     throw err;
   }
-  await c.env.BUCKET.delete(row.r2_key);
-  await c.env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(row.id).run();
+  await deleteBundle(c.env, bundle.id);
   return c.json({ ok: true });
 });
+
+async function deleteBundle(env: Env, bundleId: string): Promise<void> {
+  const files = await env.DB.prepare(`SELECT r2_key FROM bundle_files WHERE bundle_id = ?`)
+    .bind(bundleId)
+    .all<{ r2_key: string }>();
+  for (const file of files.results) {
+    await env.BUCKET.delete(file.r2_key);
+  }
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM bundle_files WHERE bundle_id = ?`).bind(bundleId),
+    env.DB.prepare(`DELETE FROM bundles WHERE id = ?`).bind(bundleId),
+  ]);
+}
 
 function parseRange(
   header: string | undefined,
@@ -541,43 +672,51 @@ app.get('*', (c) => c.env.ASSETS.fetch(c.req.raw));
  * 自動削除 (Cron Trigger)
  * ------------------------------------------------------------------ */
 
-export async function purge(env: Env, now = Date.now()): Promise<{ files: number; uploads: number }> {
+export async function purge(
+  env: Env,
+  now = Date.now(),
+): Promise<{ bundles: number; uploads: number }> {
   // 期限切れ、またはダウンロード上限に達してグラント有効期間も過ぎたもの
   const expired = await env.DB.prepare(
-    `SELECT id, r2_key FROM files
+    `SELECT id FROM bundles
       WHERE expires_at <= ?
          OR (max_downloads IS NOT NULL
              AND download_count >= max_downloads
              AND last_claim_at IS NOT NULL
              AND last_claim_at + ? <= ?)
-      LIMIT 500`,
+      LIMIT 200`,
   )
     .bind(now, GRANT_TTL_MS, now)
-    .all<{ id: string; r2_key: string }>();
+    .all<{ id: string }>();
 
   for (const row of expired.results) {
-    await env.BUCKET.delete(row.r2_key);
-    await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(row.id).run();
+    await deleteBundle(env, row.id);
   }
 
-  // 放棄されたマルチパートアップロード
-  const stale = await env.DB.prepare(
-    `SELECT id, r2_key, r2_upload_id FROM uploads WHERE abandon_at <= ? LIMIT 200`,
-  )
+  // 放棄されたアップロードセッション
+  const stale = await env.DB.prepare(`SELECT id FROM uploads WHERE abandon_at <= ? LIMIT 100`)
     .bind(now)
-    .all<{ id: string; r2_key: string; r2_upload_id: string }>();
+    .all<{ id: string }>();
 
   for (const row of stale.results) {
-    await env.BUCKET.resumeMultipartUpload(row.r2_key, row.r2_upload_id)
-      .abort()
-      .catch(() => undefined);
+    const files = await env.DB.prepare(
+      `SELECT r2_key, r2_upload_id FROM upload_files WHERE upload_id = ?`,
+    )
+      .bind(row.id)
+      .all<{ r2_key: string; r2_upload_id: string }>();
+    for (const file of files.results) {
+      await env.BUCKET.resumeMultipartUpload(file.r2_key, file.r2_upload_id)
+        .abort()
+        .catch(() => undefined);
+    }
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM upload_parts WHERE upload_id = ?`).bind(row.id),
+      env.DB.prepare(`DELETE FROM upload_files WHERE upload_id = ?`).bind(row.id),
       env.DB.prepare(`DELETE FROM uploads WHERE id = ?`).bind(row.id),
     ]);
   }
 
-  return { files: expired.results.length, uploads: stale.results.length };
+  return { bundles: expired.results.length, uploads: stale.results.length };
 }
 
 export default {
@@ -585,7 +724,7 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
       purge(env).then((result) => {
-        console.log(`purged files=${result.files} uploads=${result.uploads}`);
+        console.log(`purged bundles=${result.bundles} uploads=${result.uploads}`);
       }),
     );
   },

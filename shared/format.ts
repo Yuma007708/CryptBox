@@ -36,6 +36,9 @@ export const KDF_SALT_BYTES = 32;
 export const PW_SALT_BYTES = 16;
 export const FILE_TOKEN_BYTES = 32;
 
+/** 1 つの共有リンクにまとめられるファイル数 */
+export const MAX_FILES_PER_BUNDLE = 50;
+
 export const HKDF_INFO = {
   kek: 'cryptbox/v1/kek',
   auth: 'cryptbox/v1/auth',

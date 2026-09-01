@@ -26,7 +26,7 @@ import {
 const CONCURRENCY = 3;
 
 export interface UploadOptions {
-  file: File;
+  files: File[];
   password: string;
   expiresIn: number;
   maxDownloads: number | null;
@@ -38,24 +38,37 @@ export interface UploadOptions {
 export interface UploadResult {
   url: string;
   token: string;
+  linkSecret: string;
   expiresAt: number;
   maxDownloads: number | null;
 }
 
-export async function uploadFile(options: UploadOptions): Promise<UploadResult> {
-  const { file, password, signal } = options;
+interface PreparedFile {
+  file: File;
+  cek: CryptoKey;
+  noncePrefix: Uint8Array;
+  wrapNonce: Uint8Array;
+  metaNonce: Uint8Array;
+  wrappedCek: Uint8Array;
+  metaCipher: Uint8Array;
+  chunks: number;
+}
+
+/**
+ * 選択されたファイル群を 1 つの共有リンク（バンドル）として暗号化・送信する。
+ * ファイルごとに独立した CEK を持ち、それらを共通の KEK でラップする。
+ */
+export async function uploadBundle(options: UploadOptions): Promise<UploadResult> {
+  const { files, password, signal } = options;
+  if (files.length === 0) throw new Error('ファイルが選択されていません');
+
   const chunkSize = DEFAULT_CHUNK_SIZE;
-  const chunks = computeChunks(file.size, chunkSize);
+  const totalPlainSize = files.reduce((sum, file) => sum + file.size, 0);
 
   options.onStage('鍵を生成しています…');
   const linkSecret = randomBytes(LINK_SECRET_BYTES);
   const kdfSalt = randomBytes(KDF_SALT_BYTES);
   const pwSalt = randomBytes(PW_SALT_BYTES);
-  const noncePrefix = randomBytes(NONCE_PREFIX_BYTES);
-  const wrapNonce = randomBytes(NONCE_BYTES);
-  const metaNonce = randomBytes(NONCE_BYTES);
-  const cekRaw = randomBytes(KEY_BYTES);
-  const cek = await importCek(cekRaw);
 
   if (password) options.onStage('Argon2id でパスワードから鍵を導出しています…');
   const keys = await deriveKeys({
@@ -67,22 +80,40 @@ export async function uploadFile(options: UploadOptions): Promise<UploadResult> 
   });
   const authToken = await deriveAuthToken(linkSecret);
 
-  const wrappedCek = await wrapCek(keys.kek, cekRaw, wrapNonce);
-  const metaCipher = await encryptMeta(
-    cek,
-    { name: file.name, type: file.type, size: file.size },
-    metaNonce,
-  );
-  cekRaw.fill(0);
+  options.onStage('ファイルごとの鍵を用意しています…');
+  const prepared: PreparedFile[] = [];
+  for (const file of files) {
+    const cekRaw = randomBytes(KEY_BYTES);
+    const cek = await importCek(cekRaw);
+    const noncePrefix = randomBytes(NONCE_PREFIX_BYTES);
+    const wrapNonce = randomBytes(NONCE_BYTES);
+    const metaNonce = randomBytes(NONCE_BYTES);
+    const wrappedCek = await wrapCek(keys.kek, cekRaw, wrapNonce);
+    const metaCipher = await encryptMeta(
+      cek,
+      { name: file.name, type: file.type, size: file.size },
+      metaNonce,
+    );
+    cekRaw.fill(0);
+    prepared.push({
+      file,
+      cek,
+      noncePrefix,
+      wrapNonce,
+      metaNonce,
+      wrappedCek,
+      metaCipher,
+      chunks: computeChunks(file.size, chunkSize),
+    });
+  }
 
   options.onStage('アップロードを開始しています…');
-  const session = await postJson<{ uploadToken: string; totalChunks: number }>(
+  const session = await postJson<{ uploadToken: string; files: { index: number }[] }>(
     '/api/uploads',
-    { plainSize: file.size, chunkSize },
+    { chunkSize, files: files.map((file) => ({ plainSize: file.size })) },
     signal,
   );
 
-  let sent = 0;
   const abortSession = async () => {
     try {
       await fetch(`/api/uploads/${encodeURIComponent(session.uploadToken)}`, { method: 'DELETE' });
@@ -93,23 +124,40 @@ export async function uploadFile(options: UploadOptions): Promise<UploadResult> 
 
   try {
     options.onStage('暗号化してアップロードしています…');
+
+    // (ファイル番号, チャンク番号) の平坦なタスク列を数本のワーカーで消化する
+    const tasks: Array<{ fileIndex: number; chunkIndex: number }> = [];
+    prepared.forEach((entry, fileIndex) => {
+      for (let chunkIndex = 0; chunkIndex < entry.chunks; chunkIndex++) {
+        tasks.push({ fileIndex, chunkIndex });
+      }
+    });
+
+    let sent = 0;
     let next = 0;
     const worker = async () => {
       for (;;) {
-        const index = next++;
-        if (index >= chunks) return;
+        const task = tasks[next++];
+        if (!task) return;
         if (signal.aborted) throw new DOMException('中止されました', 'AbortError');
 
-        const start = index * chunkSize;
-        const end = Math.min(file.size, start + chunkSize);
-        const plain = new Uint8Array(await file.slice(start, end).arrayBuffer());
-        const cipher = await encryptChunk(cek, plain, noncePrefix, index, chunks);
+        const entry = prepared[task.fileIndex]!;
+        const start = task.chunkIndex * chunkSize;
+        const end = Math.min(entry.file.size, start + chunkSize);
+        const plain = new Uint8Array(await entry.file.slice(start, end).arrayBuffer());
+        const cipher = await encryptChunk(
+          entry.cek,
+          plain,
+          entry.noncePrefix,
+          task.chunkIndex,
+          entry.chunks,
+        );
         plain.fill(0);
 
         await withRetry(
           () =>
             putBytes(
-              `/api/uploads/${encodeURIComponent(session.uploadToken)}/parts/${index}`,
+              `/api/uploads/${encodeURIComponent(session.uploadToken)}/files/${task.fileIndex}/parts/${task.chunkIndex}`,
               cipher,
               signal,
             ),
@@ -117,38 +165,45 @@ export async function uploadFile(options: UploadOptions): Promise<UploadResult> 
         );
 
         sent += end - start;
-        options.onProgress(sent, file.size);
+        options.onProgress(sent, totalPlainSize);
       }
     };
 
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, chunks) }, worker));
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, tasks.length) }, worker));
 
     options.onStage('仕上げをしています…');
-    const completed = await postJson<{ token: string; expiresAt: number; maxDownloads: number | null }>(
+    const completed = await postJson<{
+      token: string;
+      expiresAt: number;
+      maxDownloads: number | null;
+    }>(
       `/api/uploads/${encodeURIComponent(session.uploadToken)}/complete`,
       {
         expiresIn: options.expiresIn,
         maxDownloads: options.maxDownloads,
         authHash: await sha256Hex(authToken),
+        kdfSalt: toBase64Url(kdfSalt),
         hasPassword: Boolean(password),
         pwSalt: password ? toBase64Url(pwSalt) : null,
         pwParams: password ? ARGON2_DEFAULTS : null,
         pwHash: keys.pwVerifier ? await sha256Hex(keys.pwVerifier) : null,
-        noncePrefix: toBase64Url(noncePrefix),
-        kdfSalt: toBase64Url(kdfSalt),
-        wrappedCek: toBase64Url(wrappedCek),
-        wrapNonce: toBase64Url(wrapNonce),
-        metaCipher: toBase64Url(metaCipher),
-        metaNonce: toBase64Url(metaNonce),
+        files: prepared.map((entry) => ({
+          noncePrefix: toBase64Url(entry.noncePrefix),
+          wrappedCek: toBase64Url(entry.wrappedCek),
+          wrapNonce: toBase64Url(entry.wrapNonce),
+          metaCipher: toBase64Url(entry.metaCipher),
+          metaNonce: toBase64Url(entry.metaNonce),
+        })),
       },
       signal,
     );
 
     // 復号鍵はフラグメントに載せる = HTTP リクエストに含まれずサーバーには届かない
-    const url = `${location.origin}/d/${completed.token}#${toBase64Url(linkSecret)}`;
+    const secret = toBase64Url(linkSecret);
     return {
-      url,
+      url: `${location.origin}/d/${completed.token}#${secret}`,
       token: completed.token,
+      linkSecret: secret,
       expiresAt: completed.expiresAt,
       maxDownloads: completed.maxDownloads,
     };

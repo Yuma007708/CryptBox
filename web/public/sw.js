@@ -28,7 +28,9 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin || !url.pathname.startsWith('/_dl/')) return;
 
-  const id = url.pathname.slice('/_dl/'.length);
+  // /_dl/<id>/<ファイル名> 。末尾にファイル名を置くのは、
+  // Content-Disposition を解釈できない環境でも名前が保たれるようにするため
+  const id = url.pathname.slice('/_dl/'.length).split('/')[0];
   const entry = streams.get(id);
   if (!entry) {
     event.respondWith(new Response('Not Found', { status: 404 }));
@@ -61,16 +63,18 @@ self.addEventListener('fetch', (event) => {
     },
   });
 
+  // RFC 6266: 非 ASCII 名は filename* で渡し、古い解析系のために ASCII の代替も付ける
   const encoded = encodeURIComponent(filename).replace(/['()*]/g, (c) =>
     '%' + c.charCodeAt(0).toString(16).toUpperCase(),
   );
+  const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'download';
 
   event.respondWith(
     new Response(body, {
       headers: {
         'Content-Type': 'application/octet-stream',
         'Content-Length': String(size),
-        'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`,
+        'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`,
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
       },

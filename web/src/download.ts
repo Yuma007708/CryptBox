@@ -1,5 +1,12 @@
-import { ApiError, postJson } from './api.js';
-import { decryptChunk, decryptMeta, deriveKeys, importCek, unwrapCek, type FileMeta } from './crypto.js';
+import { ApiError, deleteJson, postJson } from './api.js';
+import {
+  decryptChunk,
+  decryptMeta,
+  deriveKeys,
+  importCek,
+  unwrapCek,
+  type FileMeta,
+} from './crypto.js';
 import {
   type Argon2Params,
   GCM_TAG_BYTES,
@@ -7,23 +14,30 @@ import {
   toBase64Url,
 } from '../../shared/format.js';
 
-export interface FileInfo {
+export interface RemoteFile {
+  index: number;
   plainSize: number;
   cipherSize: number;
   chunkSize: number;
   totalChunks: number;
   noncePrefix: string;
-  kdfSalt: string;
   wrappedCek: string;
   wrapNonce: string;
   metaCipher: string;
   metaNonce: string;
-  hasPassword: boolean;
-  pwSalt: string | null;
-  pwParams: Argon2Params | null;
+}
+
+export interface BundleInfo {
+  createdAt: number;
   expiresAt: number;
   maxDownloads: number | null;
   remainingDownloads: number | null;
+  totalPlainSize: number;
+  kdfSalt: string;
+  hasPassword: boolean;
+  pwSalt: string | null;
+  pwParams: Argon2Params | null;
+  files: RemoteFile[];
 }
 
 export class WrongPassword extends Error {
@@ -32,24 +46,39 @@ export class WrongPassword extends Error {
   }
 }
 
-export async function fetchInfo(token: string, authToken: Uint8Array): Promise<FileInfo> {
-  return postJson<FileInfo>(`/api/files/${encodeURIComponent(token)}/info`, {
+export async function fetchInfo(token: string, authToken: Uint8Array): Promise<BundleInfo> {
+  return postJson<BundleInfo>(`/api/files/${encodeURIComponent(token)}/info`, {
+    authToken: toBase64Url(authToken),
+  });
+}
+
+export async function deleteBundle(token: string, authToken: Uint8Array): Promise<void> {
+  await deleteJson(`/api/files/${encodeURIComponent(token)}`, {
     authToken: toBase64Url(authToken),
   });
 }
 
 export interface OpenedFile {
+  remote: RemoteFile;
   meta: FileMeta;
   cek: CryptoKey;
+}
+
+export interface OpenedBundle {
+  files: OpenedFile[];
   pwVerifier: Uint8Array | null;
 }
 
 /**
- * 鍵を導出してファイル鍵を取り出し、メタデータを復号する。
+ * 鍵を導出して各ファイルの CEK を取り出し、ファイル名を復号する。
  * パスワードが違えば AES-GCM の認証に失敗するので、
  * サーバーに問い合わせる前に（＝ダウンロード回数を消費せずに）判定できる。
  */
-export async function openFile(info: FileInfo, linkSecret: Uint8Array, password: string): Promise<OpenedFile> {
+export async function openBundle(
+  info: BundleInfo,
+  linkSecret: Uint8Array,
+  password: string,
+): Promise<OpenedBundle> {
   const keys = await deriveKeys({
     linkSecret,
     kdfSalt: fromBase64Url(info.kdfSalt),
@@ -58,17 +87,29 @@ export async function openFile(info: FileInfo, linkSecret: Uint8Array, password:
     pwParams: info.pwParams ?? undefined,
   });
 
-  let cekRaw: Uint8Array;
-  try {
-    cekRaw = await unwrapCek(keys.kek, fromBase64Url(info.wrappedCek), fromBase64Url(info.wrapNonce));
-  } catch {
-    throw new WrongPassword();
+  const files: OpenedFile[] = [];
+  for (const remote of info.files) {
+    let cekRaw: Uint8Array;
+    try {
+      cekRaw = await unwrapCek(
+        keys.kek,
+        fromBase64Url(remote.wrappedCek),
+        fromBase64Url(remote.wrapNonce),
+      );
+    } catch {
+      throw new WrongPassword();
+    }
+    const cek = await importCek(cekRaw);
+    cekRaw.fill(0);
+    const meta = await decryptMeta(
+      cek,
+      fromBase64Url(remote.metaCipher),
+      fromBase64Url(remote.metaNonce),
+    );
+    files.push({ remote, meta, cek });
   }
 
-  const cek = await importCek(cekRaw);
-  cekRaw.fill(0);
-  const meta = await decryptMeta(cek, fromBase64Url(info.metaCipher), fromBase64Url(info.metaNonce));
-  return { meta, cek, pwVerifier: keys.pwVerifier };
+  return { files, pwVerifier: keys.pwVerifier };
 }
 
 export interface Claim {
@@ -77,7 +118,7 @@ export interface Claim {
   remainingDownloads: number | null;
 }
 
-/** ダウンロード回数を 1 消費し、本体取得用のグラントを得る */
+/** ダウンロード回数を 1 消費し、バンドル全体の取得に使えるグラントを得る */
 export async function claim(
   token: string,
   authToken: Uint8Array,
@@ -90,16 +131,16 @@ export async function claim(
 }
 
 /** チャンク i の暗号文の長さ */
-function cipherLengthOf(index: number, info: FileInfo): number {
-  const plainStart = index * info.chunkSize;
-  const plainLength = Math.min(info.chunkSize, Math.max(0, info.plainSize - plainStart));
+function cipherLengthOf(index: number, file: RemoteFile): number {
+  const plainStart = index * file.chunkSize;
+  const plainLength = Math.min(file.chunkSize, Math.max(0, file.plainSize - plainStart));
   return plainLength + GCM_TAG_BYTES;
 }
 
 interface StreamOptions {
   token: string;
   grant: string;
-  info: FileInfo;
+  file: RemoteFile;
   cek: CryptoKey;
   signal: AbortSignal;
   onProgress(plainBytes: number): void;
@@ -112,8 +153,8 @@ interface StreamOptions {
  * （＝巨大ファイルでも最初からやり直しにならない）。
  */
 export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Array> {
-  const { token, grant, info, cek, signal } = options;
-  const noncePrefix = fromBase64Url(info.noncePrefix);
+  const { token, grant, file, cek, signal } = options;
+  const noncePrefix = fromBase64Url(file.noncePrefix);
 
   let chunkIndex = 0;
   let cipherOffset = 0;
@@ -125,7 +166,9 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
   let buffered = 0;
 
   async function openStream(): Promise<void> {
-    const url = `/api/files/${encodeURIComponent(token)}/blob?g=${encodeURIComponent(grant)}`;
+    const url =
+      `/api/files/${encodeURIComponent(token)}/files/${file.index}/blob` +
+      `?g=${encodeURIComponent(grant)}`;
     const response = await fetch(url, {
       headers: cipherOffset > 0 ? { Range: `bytes=${cipherOffset}-` } : {},
       signal,
@@ -167,11 +210,11 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
   }
 
   async function nextChunk(): Promise<Uint8Array | null> {
-    while (chunkIndex < info.totalChunks) {
-      const needed = cipherLengthOf(chunkIndex, info);
+    while (chunkIndex < file.totalChunks) {
+      const needed = cipherLengthOf(chunkIndex, file);
       if (buffered >= needed) {
         const cipher = take(needed);
-        const plain = await decryptChunk(cek, cipher, noncePrefix, chunkIndex, info.totalChunks);
+        const plain = await decryptChunk(cek, cipher, noncePrefix, chunkIndex, file.totalChunks);
         chunkIndex += 1;
         cipherOffset += needed;
         plainDone += plain.length;
@@ -184,7 +227,7 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
         if (!reader) await openStream();
         const { value, done } = await reader!.read();
         if (done) {
-          if (buffered > 0 || chunkIndex < info.totalChunks) {
+          if (buffered > 0 || chunkIndex < file.totalChunks) {
             throw new Error('転送が途中で終了しました');
           }
           return null;

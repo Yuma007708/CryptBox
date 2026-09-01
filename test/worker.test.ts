@@ -22,8 +22,8 @@ import {
   NONCE_BYTES,
   NONCE_PREFIX_BYTES,
   PW_SALT_BYTES,
-  toBase64Url,
   fromBase64Url,
+  toBase64Url,
   totalChunks,
 } from '../shared/format.js';
 
@@ -53,18 +53,19 @@ interface Uploaded {
   authToken: Uint8Array;
 }
 
+const json = (body: unknown): RequestInit => ({
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
+
 async function upload(
-  plain: Uint8Array,
+  contents: Uint8Array[],
   options: { expiresIn?: number; maxDownloads?: number | null; password?: string } = {},
 ): Promise<Uploaded> {
   const linkSecret = randomBytes(LINK_SECRET_BYTES);
   const kdfSalt = randomBytes(KDF_SALT_BYTES);
   const pwSalt = randomBytes(PW_SALT_BYTES);
-  const noncePrefix = randomBytes(NONCE_PREFIX_BYTES);
-  const wrapNonce = randomBytes(NONCE_BYTES);
-  const metaNonce = randomBytes(NONCE_BYTES);
-  const cekRaw = randomBytes(KEY_BYTES);
-  const cek = await importCek(cekRaw);
 
   const keys = await deriveKeysFromMaterial({
     linkSecret,
@@ -73,69 +74,88 @@ async function upload(
   });
   const authToken = await deriveAuthToken(linkSecret);
 
-  const created = await SELF.fetch(`${ORIGIN}/api/uploads`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ plainSize: plain.length, chunkSize: CHUNK_SIZE }),
-  });
+  const created = await SELF.fetch(
+    `${ORIGIN}/api/uploads`,
+    json({ chunkSize: CHUNK_SIZE, files: contents.map((plain) => ({ plainSize: plain.length })) }),
+  );
   expect(created.status).toBe(200);
   const { uploadToken } = (await created.json()) as { uploadToken: string };
 
-  const chunks = totalChunks(plain.length, CHUNK_SIZE);
-  for (let i = 0; i < chunks; i++) {
-    const slice = plain.subarray(i * CHUNK_SIZE, Math.min(plain.length, (i + 1) * CHUNK_SIZE));
-    const cipher = await encryptChunk(cek, slice, noncePrefix, i, chunks);
-    const put = await SELF.fetch(`${ORIGIN}/api/uploads/${uploadToken}/parts/${i}`, {
-      method: 'PUT',
-      body: cipher,
+  const fileMetas: unknown[] = [];
+  for (const [fileIndex, plain] of contents.entries()) {
+    const cekRaw = randomBytes(KEY_BYTES);
+    const cek = await importCek(cekRaw);
+    const noncePrefix = randomBytes(NONCE_PREFIX_BYTES);
+    const wrapNonce = randomBytes(NONCE_BYTES);
+    const metaNonce = randomBytes(NONCE_BYTES);
+    const chunks = totalChunks(plain.length, CHUNK_SIZE);
+
+    for (let i = 0; i < chunks; i++) {
+      const slice = plain.subarray(i * CHUNK_SIZE, Math.min(plain.length, (i + 1) * CHUNK_SIZE));
+      const cipher = await encryptChunk(cek, slice, noncePrefix, i, chunks);
+      const put = await SELF.fetch(
+        `${ORIGIN}/api/uploads/${uploadToken}/files/${fileIndex}/parts/${i}`,
+        { method: 'PUT', body: cipher },
+      );
+      expect(put.status).toBe(200);
+    }
+
+    fileMetas.push({
+      noncePrefix: toBase64Url(noncePrefix),
+      wrappedCek: toBase64Url(await wrapCek(keys.kek, cekRaw, wrapNonce)),
+      wrapNonce: toBase64Url(wrapNonce),
+      metaCipher: toBase64Url(
+        await encryptMeta(
+          cek,
+          { name: `サンプル${fileIndex}.bin`, type: '', size: plain.length },
+          metaNonce,
+        ),
+      ),
+      metaNonce: toBase64Url(metaNonce),
     });
-    expect(put.status).toBe(200);
   }
 
-  const completed = await SELF.fetch(`${ORIGIN}/api/uploads/${uploadToken}/complete`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const completed = await SELF.fetch(
+    `${ORIGIN}/api/uploads/${uploadToken}/complete`,
+    json({
       expiresIn: options.expiresIn ?? 3600,
       maxDownloads: options.maxDownloads === undefined ? null : options.maxDownloads,
       authHash: await sha256Hex(authToken),
+      kdfSalt: toBase64Url(kdfSalt),
       hasPassword: Boolean(options.password),
       pwSalt: options.password ? toBase64Url(pwSalt) : null,
       pwParams: options.password ? ARGON2_PARAMS : null,
       pwHash: keys.pwVerifier ? await sha256Hex(keys.pwVerifier) : null,
-      noncePrefix: toBase64Url(noncePrefix),
-      kdfSalt: toBase64Url(kdfSalt),
-      wrappedCek: toBase64Url(await wrapCek(keys.kek, cekRaw, wrapNonce)),
-      wrapNonce: toBase64Url(wrapNonce),
-      metaCipher: toBase64Url(
-        await encryptMeta(cek, { name: 'サンプル.bin', type: '', size: plain.length }, metaNonce),
-      ),
-      metaNonce: toBase64Url(metaNonce),
+      files: fileMetas,
     }),
-  });
+  );
   expect(completed.status).toBe(200);
   const { token } = (await completed.json()) as { token: string };
   return { token, linkSecret, authToken };
 }
 
-async function download(uploaded: Uploaded, password?: string): Promise<Uint8Array> {
-  const infoResponse = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/info`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken) }),
-  });
+interface RemoteFile {
+  index: number;
+  plainSize: number;
+  chunkSize: number;
+  totalChunks: number;
+  noncePrefix: string;
+  wrappedCek: string;
+  wrapNonce: string;
+  metaCipher: string;
+  metaNonce: string;
+}
+
+async function download(uploaded: Uploaded, password?: string): Promise<Uint8Array[]> {
+  const infoResponse = await SELF.fetch(
+    `${ORIGIN}/api/files/${uploaded.token}/info`,
+    json({ authToken: toBase64Url(uploaded.authToken) }),
+  );
   expect(infoResponse.status).toBe(200);
-  const info = (await infoResponse.json()) as Record<string, never> & {
-    plainSize: number;
-    chunkSize: number;
-    totalChunks: number;
-    noncePrefix: string;
+  const info = (await infoResponse.json()) as {
     kdfSalt: string;
-    wrappedCek: string;
-    wrapNonce: string;
-    metaCipher: string;
-    metaNonce: string;
     pwSalt: string | null;
+    files: RemoteFile[];
   };
 
   const keys = await deriveKeysFromMaterial({
@@ -143,39 +163,49 @@ async function download(uploaded: Uploaded, password?: string): Promise<Uint8Arr
     kdfSalt: fromBase64Url(info.kdfSalt),
     pwKey: password && info.pwSalt ? await stretch(password, fromBase64Url(info.pwSalt)) : null,
   });
-  const cek = await importCek(
-    await unwrapCek(keys.kek, fromBase64Url(info.wrappedCek), fromBase64Url(info.wrapNonce)),
-  );
-  const meta = await decryptMeta(cek, fromBase64Url(info.metaCipher), fromBase64Url(info.metaNonce));
-  expect(meta.name).toBe('サンプル.bin');
 
-  const claimed = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/claim`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const claimed = await SELF.fetch(
+    `${ORIGIN}/api/files/${uploaded.token}/claim`,
+    json({
       authToken: toBase64Url(uploaded.authToken),
       pwVerifier: keys.pwVerifier ? toBase64Url(keys.pwVerifier) : null,
     }),
-  });
+  );
   expect(claimed.status).toBe(200);
   const { grant } = (await claimed.json()) as { grant: string };
 
-  const blob = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/blob?g=${encodeURIComponent(grant)}`);
-  expect(blob.status).toBe(200);
-  const cipher = new Uint8Array(await blob.arrayBuffer());
+  const restored: Uint8Array[] = [];
+  for (const file of info.files) {
+    const cek = await importCek(
+      await unwrapCek(keys.kek, fromBase64Url(file.wrappedCek), fromBase64Url(file.wrapNonce)),
+    );
+    const meta = await decryptMeta(
+      cek,
+      fromBase64Url(file.metaCipher),
+      fromBase64Url(file.metaNonce),
+    );
+    expect(meta.name).toBe(`サンプル${file.index}.bin`);
 
-  const noncePrefix = fromBase64Url(info.noncePrefix);
-  const out = new Uint8Array(info.plainSize);
-  let cipherOffset = 0;
-  let plainOffset = 0;
-  for (let i = 0; i < info.totalChunks; i++) {
-    const plainLength = Math.min(info.chunkSize, info.plainSize - i * info.chunkSize);
-    const piece = cipher.subarray(cipherOffset, cipherOffset + plainLength + 16);
-    out.set(await decryptChunk(cek, piece, noncePrefix, i, info.totalChunks), plainOffset);
-    cipherOffset += piece.length;
-    plainOffset += plainLength;
+    const blob = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/files/${file.index}/blob?g=${encodeURIComponent(grant)}`,
+    );
+    expect(blob.status).toBe(200);
+    const cipher = new Uint8Array(await blob.arrayBuffer());
+
+    const noncePrefix = fromBase64Url(file.noncePrefix);
+    const out = new Uint8Array(file.plainSize);
+    let cipherOffset = 0;
+    let plainOffset = 0;
+    for (let i = 0; i < file.totalChunks; i++) {
+      const plainLength = Math.min(file.chunkSize, file.plainSize - i * file.chunkSize);
+      const piece = cipher.subarray(cipherOffset, cipherOffset + plainLength + 16);
+      out.set(await decryptChunk(cek, piece, noncePrefix, i, file.totalChunks), plainOffset);
+      cipherOffset += piece.length;
+      plainOffset += plainLength;
+    }
+    restored.push(out);
   }
-  return out;
+  return restored;
 }
 
 beforeAll(applySchema);
@@ -184,90 +214,117 @@ beforeEach(resetTables);
 describe('アップロードとダウンロードの往復', () => {
   it('複数チャンクのファイルをバイト単位で復元できる', async () => {
     const plain = randomBytes(CHUNK_SIZE + 1234);
-    const uploaded = await upload(plain);
-    const restored = await download(uploaded);
-    expect(restored.length).toBe(plain.length);
-    expect(Array.from(restored.subarray(0, 64))).toEqual(Array.from(plain.subarray(0, 64)));
-    expect(Array.from(restored.subarray(-64))).toEqual(Array.from(plain.subarray(-64)));
-    expect(await sha256Hex(restored)).toBe(await sha256Hex(plain));
+    const [restored] = await download(await upload([plain]));
+    expect(restored!.length).toBe(plain.length);
+    expect(await sha256Hex(restored!)).toBe(await sha256Hex(plain));
+  });
+
+  it('1 つのリンクで複数ファイルを送れる', async () => {
+    const files = [randomBytes(4096), randomBytes(CHUNK_SIZE + 10), randomBytes(1)];
+    const restored = await download(await upload(files));
+    expect(restored).toHaveLength(3);
+    for (const [index, original] of files.entries()) {
+      expect(await sha256Hex(restored[index]!)).toBe(await sha256Hex(original));
+    }
   });
 
   it('空ファイルも扱える', async () => {
-    const uploaded = await upload(new Uint8Array(0));
-    expect((await download(uploaded)).length).toBe(0);
+    const [restored] = await download(await upload([new Uint8Array(0)]));
+    expect(restored!.length).toBe(0);
   });
 
   it('パスワード付きファイルを往復できる', async () => {
     const plain = randomBytes(2048);
-    const uploaded = await upload(plain, { password: 'とても長いパスフレーズ' });
-    expect(await sha256Hex(await download(uploaded, 'とても長いパスフレーズ'))).toBe(
-      await sha256Hex(plain),
-    );
+    const uploaded = await upload([plain], { password: 'とても長いパスフレーズ' });
+    const [restored] = await download(uploaded, 'とても長いパスフレーズ');
+    expect(await sha256Hex(restored!)).toBe(await sha256Hex(plain));
   });
 });
 
 describe('アクセス制御', () => {
   it('authToken が違えば 404', async () => {
-    const uploaded = await upload(randomBytes(128));
-    const response = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/info`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ authToken: toBase64Url(randomBytes(32)) }),
-    });
+    const uploaded = await upload([randomBytes(128)]);
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(randomBytes(32)) }),
+    );
     expect(response.status).toBe(404);
   });
 
   it('グラント無しでは本体を取得できない', async () => {
-    const uploaded = await upload(randomBytes(128));
-    const response = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/blob`);
+    const uploaded = await upload([randomBytes(128)]);
+    const response = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/files/0/blob`);
     expect(response.status).toBe(403);
   });
 
   it('パスワードが違えばダウンロード回数を消費せずに 401', async () => {
-    const uploaded = await upload(randomBytes(128), { password: 'ただしいパスワード', maxDownloads: 1 });
-    const response = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const uploaded = await upload([randomBytes(128)], {
+      password: 'ただしいパスワード',
+      maxDownloads: 1,
+    });
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({
         authToken: toBase64Url(uploaded.authToken),
         pwVerifier: toBase64Url(randomBytes(32)),
       }),
-    });
+    );
     expect(response.status).toBe(401);
 
-    const row = await env.DB.prepare('SELECT download_count FROM files').first<{
+    const row = await env.DB.prepare('SELECT download_count FROM bundles').first<{
       download_count: number;
     }>();
     expect(row?.download_count).toBe(0);
   });
+
+  it('リンクを知っていれば即時削除できる', async () => {
+    const uploaded = await upload([randomBytes(256)]);
+    const deleted = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken) }),
+    });
+    expect(deleted.status).toBe(200);
+
+    const after = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(uploaded.authToken) }),
+    );
+    expect(after.status).toBe(404);
+    const files = await env.DB.prepare('SELECT COUNT(*) AS n FROM bundle_files').first<{ n: number }>();
+    expect(files?.n).toBe(0);
+  });
 });
 
 describe('ダウンロード回数制限', () => {
-  it('上限に達すると 410 を返す', async () => {
-    const uploaded = await upload(randomBytes(128), { maxDownloads: 1 });
+  it('バンドル単位で数える（ファイル数では減らない）', async () => {
+    const uploaded = await upload([randomBytes(128), randomBytes(128)], { maxDownloads: 1 });
     await download(uploaded);
 
-    const second = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
-    });
+    const row = await env.DB.prepare('SELECT download_count FROM bundles').first<{
+      download_count: number;
+    }>();
+    expect(row?.download_count).toBe(1);
+
+    const second = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
+    );
     expect(second.status).toBe(410);
   });
 });
 
 describe('レンジ取得', () => {
   it('206 と Content-Range を返す', async () => {
-    const uploaded = await upload(randomBytes(1000));
-    const claimed = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
-    });
+    const uploaded = await upload([randomBytes(1000)]);
+    const claimed = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
+    );
     const { grant } = (await claimed.json()) as { grant: string };
 
     const response = await SELF.fetch(
-      `${ORIGIN}/api/files/${uploaded.token}/blob?g=${encodeURIComponent(grant)}`,
+      `${ORIGIN}/api/files/${uploaded.token}/files/0/blob?g=${encodeURIComponent(grant)}`,
       { headers: { Range: 'bytes=100-199' } },
     );
     expect(response.status).toBe(206);
@@ -277,29 +334,28 @@ describe('レンジ取得', () => {
 });
 
 describe('自動削除', () => {
-  it('期限切れのファイルは本体ごと消える', async () => {
-    const uploaded = await upload(randomBytes(256), { expiresIn: 3600 });
-    const key = await env.DB.prepare('SELECT r2_key FROM files').first<{ r2_key: string }>();
-    expect(await env.BUCKET.head(key!.r2_key)).not.toBeNull();
+  it('期限切れのバンドルは本体ごと消える', async () => {
+    const uploaded = await upload([randomBytes(256), randomBytes(256)], { expiresIn: 3600 });
+    const keys = await env.DB.prepare('SELECT r2_key FROM bundle_files').all<{ r2_key: string }>();
+    expect(keys.results).toHaveLength(2);
+    for (const key of keys.results) expect(await env.BUCKET.head(key.r2_key)).not.toBeNull();
 
     const result = await purge(env, Date.now() + 3601 * 1000);
-    expect(result.files).toBe(1);
-    expect(await env.BUCKET.head(key!.r2_key)).toBeNull();
+    expect(result.bundles).toBe(1);
+    for (const key of keys.results) expect(await env.BUCKET.head(key.r2_key)).toBeNull();
 
-    const response = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/info`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken) }),
-    });
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(uploaded.authToken) }),
+    );
     expect(response.status).toBe(404);
   });
 
   it('放棄されたアップロードセッションも消える', async () => {
-    const created = await SELF.fetch(`${ORIGIN}/api/uploads`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ plainSize: 1024, chunkSize: CHUNK_SIZE }),
-    });
+    const created = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({ chunkSize: CHUNK_SIZE, files: [{ plainSize: 1024 }] }),
+    );
     expect(created.status).toBe(200);
 
     const result = await purge(env, Date.now() + 25 * 60 * 60 * 1000);
@@ -311,20 +367,46 @@ describe('自動削除', () => {
 
 describe('入力検証', () => {
   it('小さすぎる chunkSize は拒否する', async () => {
-    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ plainSize: 100, chunkSize: 1024 }),
-    });
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({ chunkSize: 1024, files: [{ plainSize: 100 }] }),
+    );
     expect(response.status).toBe(400);
   });
 
-  it('上限を超えるサイズは拒否する', async () => {
-    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ plainSize: 2 * 1024 * 1024 * 1024, chunkSize: CHUNK_SIZE }),
-    });
+  it('合計サイズが上限を超えると拒否する', async () => {
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({
+        chunkSize: CHUNK_SIZE,
+        files: [{ plainSize: 600 * 1024 * 1024 }, { plainSize: 600 * 1024 * 1024 }],
+      }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('ファイル数が 0 なら拒否する', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, json({ chunkSize: CHUNK_SIZE, files: [] }));
+    expect(response.status).toBe(400);
+  });
+
+  it('complete でファイル数が合わなければ拒否する', async () => {
+    const created = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({ chunkSize: CHUNK_SIZE, files: [{ plainSize: 10 }] }),
+    );
+    const { uploadToken } = (await created.json()) as { uploadToken: string };
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads/${uploadToken}/complete`,
+      json({
+        expiresIn: 3600,
+        maxDownloads: null,
+        authHash: 'a'.repeat(64),
+        kdfSalt: toBase64Url(randomBytes(KDF_SALT_BYTES)),
+        hasPassword: false,
+        files: [],
+      }),
+    );
     expect(response.status).toBe(400);
   });
 });

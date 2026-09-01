@@ -17,8 +17,10 @@ export async function applySchema(): Promise<void> {
 
 export async function resetTables(): Promise<void> {
   await env.DB.batch([
-    env.DB.prepare('DELETE FROM files'),
-    env.DB.prepare('DELETE FROM uploads'),
+    env.DB.prepare('DELETE FROM bundle_files'),
+    env.DB.prepare('DELETE FROM bundles'),
     env.DB.prepare('DELETE FROM upload_parts'),
+    env.DB.prepare('DELETE FROM upload_files'),
+    env.DB.prepare('DELETE FROM uploads'),
   ]);
 }

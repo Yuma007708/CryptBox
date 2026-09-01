@@ -59,10 +59,17 @@ export function prepareServiceWorker(): Promise<ServiceWorkerRegistration | null
 /**
  * 保存先を用意する。File System Access API を使う可能性があるため、
  * 必ずユーザー操作（クリック）のハンドラから同期的に呼ぶこと。
+ *
+ * 複数ファイルを続けて保存する場合は allowPicker を false にする。
+ * 2 ファイル目以降はユーザー操作から離れており、保存ダイアログを開けないため。
  */
-export async function createSaver(filename: string, size: number): Promise<Saver> {
+export async function createSaver(
+  filename: string,
+  size: number,
+  options: { allowPicker?: boolean } = {},
+): Promise<Saver> {
   const picker = (window as SaveFilePickerWindow).showSaveFilePicker;
-  if (typeof picker === 'function') {
+  if (options.allowPicker !== false && typeof picker === 'function') {
     const handle = await picker({ suggestedName: filename });
     const writable = await handle.createWritable();
     return {
@@ -126,7 +133,7 @@ function createServiceWorkerSaver(filename: string, size: number): Saver {
   // SW が Content-Disposition: attachment を返すので、iframe を開くだけで保存が始まる
   const frame = document.createElement('iframe');
   frame.hidden = true;
-  frame.src = `/_dl/${id}`;
+  frame.src = `/_dl/${id}/${encodeURIComponent(filename)}`;
   document.body.append(frame);
   const cleanup = () => frame.remove();
 

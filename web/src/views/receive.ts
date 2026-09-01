@@ -1,0 +1,332 @@
+import { clear, h } from '../dom.js';
+import { brandMark, extensionLabel, icon } from '../icons.js';
+import { formatBytes, formatDateTime, formatDuration } from '../format.js';
+import { deriveAuthToken } from '../crypto.js';
+import {
+  claim,
+  decryptedStream,
+  fetchInfo,
+  openBundle,
+  WrongPassword,
+  type BundleInfo,
+  type Claim,
+  type OpenedBundle,
+  type OpenedFile,
+} from '../download.js';
+import { createSaver, prepareServiceWorker, type Saver } from '../saver.js';
+import { fromBase64Url } from '../../../shared/format.js';
+import { createTracker, describeError } from '../ui.js';
+
+export function renderReceive(root: HTMLElement, token: string): void {
+  const alert = h('div', { class: 'alert', hidden: true });
+  const body = h('div', {});
+
+  const inner = h(
+    'div',
+    { class: 'receive-inner' },
+    h(
+      'div',
+      { class: 'receive-brand' },
+      brandMark(30),
+      h('span', { class: 'brand-name' }, 'Crypt', h('em', {}, 'Box')),
+    ),
+    h('p', { class: 'receive-tagline' }, '暗号化して、安全に送る。'),
+    alert,
+    body,
+  );
+  root.append(h('div', { class: 'receive' }, inner));
+
+  const showError = (message: string) => {
+    clear(alert);
+    alert.append(icon('shield', 'icon-sm'), h('span', {}, message));
+    alert.hidden = false;
+  };
+  const clearError = () => {
+    alert.hidden = true;
+  };
+
+  const rawSecret = location.hash.replace(/^#/, '');
+  if (!rawSecret) {
+    showError('URL に復号鍵（# より後ろ）が含まれていません。共有されたリンクをそのまま開いてください。');
+    return;
+  }
+
+  let linkSecret: Uint8Array;
+  try {
+    linkSecret = fromBase64Url(rawSecret);
+  } catch {
+    showError('復号鍵の形式が不正です。');
+    return;
+  }
+
+  body.append(
+    h(
+      'div',
+      { class: 'card' },
+      h('div', { class: 'empty' }, h('div', { class: 'spinner' }), h('p', {}, 'ファイル情報を取得しています…')),
+    ),
+  );
+
+  void prepareServiceWorker();
+  void load();
+
+  async function load(): Promise<void> {
+    let info: BundleInfo;
+    let authToken: Uint8Array;
+    try {
+      authToken = await deriveAuthToken(linkSecret);
+      info = await fetchInfo(token, authToken);
+    } catch (error) {
+      clear(body);
+      showError(describeError(error));
+      return;
+    }
+
+    if (info.hasPassword) {
+      renderPasswordPrompt(info, authToken);
+    } else {
+      try {
+        const opened = await openBundle(info, linkSecret, '');
+        renderFiles(info, authToken, opened);
+      } catch (error) {
+        clear(body);
+        showError(describeError(error));
+      }
+    }
+  }
+
+  function summaryOf(info: BundleInfo): HTMLElement {
+    return h(
+      'dl',
+      { class: 'summary' },
+      h('dt', {}, '合計サイズ'),
+      h('dd', {}, formatBytes(info.totalPlainSize)),
+      h('dt', {}, '有効期限'),
+      h(
+        'dd',
+        {},
+        `${formatDateTime(info.expiresAt)}（残り ${formatDuration((info.expiresAt - Date.now()) / 1000)}）`,
+      ),
+      h('dt', {}, '残りダウンロード'),
+      h(
+        'dd',
+        {},
+        info.remainingDownloads === null ? '無制限' : `${info.remainingDownloads} 回`,
+      ),
+    );
+  }
+
+  function renderPasswordPrompt(info: BundleInfo, authToken: Uint8Array): void {
+    clear(body);
+    const input = h('input', { type: 'password', autocomplete: 'current-password' });
+    const button = h('button', { type: 'button', class: 'primary' });
+    button.append(icon('lock', 'icon-sm'), h('span', {}, 'パスワードを確認'));
+
+    const submit = async () => {
+      clearError();
+      button.disabled = true;
+      const label = button.querySelector('span')!;
+      label.textContent = 'Argon2id で鍵を導出中…';
+      try {
+        const opened = await openBundle(info, linkSecret, input.value);
+        renderFiles(info, authToken, opened);
+      } catch (error) {
+        showError(error instanceof WrongPassword ? 'パスワードが違います' : describeError(error));
+        button.disabled = false;
+        label.textContent = 'パスワードを確認';
+      }
+    };
+
+    button.addEventListener('click', () => void submit());
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') void submit();
+    });
+
+    body.append(
+      h(
+        'div',
+        { class: 'card' },
+        h(
+          'div',
+          { class: 'card-head' },
+          h('h2', { class: 'card-title' }, 'パスワードで保護されています'),
+          h('span', { class: 'badge' }, icon('lock', 'icon-sm'), 'Argon2id'),
+        ),
+        h('p', { class: 'hint' }, '送信者から共有されたパスワードを入力してください。'),
+        h('div', { class: 'password-row' }, input),
+        h('div', { class: 'card-actions' }, h('span', {}), button),
+        summaryOf(info),
+      ),
+    );
+    input.focus();
+  }
+
+  function renderFiles(info: BundleInfo, authToken: Uint8Array, opened: OpenedBundle): void {
+    clear(body);
+    let grant: Claim | null = null;
+    let busy = false;
+
+    const ensureGrant = async (): Promise<Claim> => {
+      if (grant && grant.grantExpiresAt > Date.now() + 60_000) return grant;
+      grant = await claim(token, authToken, opened.pwVerifier);
+      return grant;
+    };
+
+    const rows = h('div', {});
+    const controls: Array<{ file: OpenedFile; run: (allowPicker: boolean) => Promise<void> }> = [];
+
+    for (const entry of opened.files) {
+      const bar = h('div', { class: 'progress-bar' });
+      const progress = h('div', { class: 'progress', hidden: true }, bar);
+      const detail = h('p', { class: 'progress-detail', hidden: true });
+      const status = h('span', { class: 'file-size' }, formatBytes(entry.meta.size));
+
+      const button = h('button', {
+        type: 'button',
+        class: 'icon-button',
+        title: `${entry.meta.name} をダウンロード`,
+      });
+      button.append(icon('download', 'icon-sm'));
+
+      const run = async (allowPicker: boolean): Promise<void> => {
+        if (busy) return;
+        clearError();
+
+        let saver: Saver;
+        try {
+          saver = await createSaver(entry.meta.name, entry.meta.size, { allowPicker });
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') return;
+          showError(describeError(error));
+          return;
+        }
+
+        busy = true;
+        button.disabled = true;
+        progress.hidden = false;
+        detail.hidden = false;
+        bar.style.width = '0%';
+        const track = createTracker(entry.meta.size);
+        const controller = new AbortController();
+
+        try {
+          const granted = await ensureGrant();
+          const stream = decryptedStream({
+            token,
+            grant: granted.grant,
+            file: entry.remote,
+            cek: entry.cek,
+            signal: controller.signal,
+            onProgress: (done) => {
+              const state = track(done);
+              bar.style.width = `${(state.ratio * 100).toFixed(1)}%`;
+              detail.textContent = state.text;
+            },
+            onRetry: (attempt) => {
+              detail.textContent = `接続が切れました。再開しています…（${attempt} 回目）`;
+            },
+          });
+
+          await stream.pipeTo(saver.writable);
+          await saver.finish();
+
+          progress.hidden = true;
+          detail.hidden = true;
+          clear(status);
+          status.append(icon('check', 'icon-sm'));
+          status.append(document.createTextNode(' 完了'));
+          clear(button);
+          button.append(icon('check', 'icon-sm'));
+          if (granted.remainingDownloads !== null) {
+            remaining.textContent = `残りダウンロード: ${granted.remainingDownloads} 回`;
+          }
+        } catch (error) {
+          controller.abort();
+          await saver.abort(error);
+          progress.hidden = true;
+          detail.hidden = true;
+          button.disabled = false;
+          showError(describeError(error));
+        } finally {
+          busy = false;
+        }
+      };
+
+      button.addEventListener('click', () => void run(true));
+      controls.push({ file: entry, run });
+
+      rows.append(
+        h(
+          'div',
+          { class: 'file-row' },
+          h('span', { class: 'file-badge' }, extensionLabel(entry.meta.name)),
+          h(
+            'div',
+            { class: 'file-main' },
+            h('div', { class: 'file-name' }, entry.meta.name),
+            progress,
+            detail,
+          ),
+          status,
+          button,
+        ),
+      );
+    }
+
+    const remaining = h(
+      'p',
+      { class: 'hint' },
+      info.remainingDownloads === null
+        ? '残りダウンロード: 無制限'
+        : `残りダウンロード: ${info.remainingDownloads} 回`,
+    );
+
+    const downloadAll = h('button', { type: 'button', class: 'primary' });
+    downloadAll.append(
+      icon('download', 'icon-sm'),
+      h('span', {}, opened.files.length === 1 ? 'ダウンロード' : 'すべてダウンロード'),
+    );
+    downloadAll.addEventListener('click', () => {
+      void (async () => {
+        downloadAll.disabled = true;
+        // 2 件目以降はユーザー操作から離れるため、保存ダイアログは使わない
+        for (const [index, control] of controls.entries()) {
+          await control.run(controls.length === 1 || index === 0);
+        }
+        downloadAll.disabled = false;
+      })();
+    });
+
+    body.append(
+      h(
+        'div',
+        { class: 'card' },
+        h(
+          'div',
+          { class: 'card-head' },
+          h(
+            'h2',
+            { class: 'card-title' },
+            opened.files.length === 1
+              ? '受信したファイル'
+              : `受信したファイル (${opened.files.length})`,
+          ),
+          h('span', { class: 'badge' }, icon('shield', 'icon-sm'), '暗号化済み'),
+        ),
+        rows,
+        h('div', { class: 'card-actions' }, remaining, downloadAll),
+      ),
+      h(
+        'div',
+        { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, 'このリンクについて')),
+        summaryOf(info),
+        h(
+          'p',
+          { class: 'hint' },
+          '復号はこのブラウザ内で行われます。サーバーは鍵もファイル名も持っていません。',
+        ),
+      ),
+    );
+  }
+}
