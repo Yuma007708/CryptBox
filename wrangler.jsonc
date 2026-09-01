@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cryptbox",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "observability": { "enabled": true },
+
+  "assets": {
+    "directory": "./web/dist",
+    "binding": "ASSETS",
+    // /d/<token> のような擬似パスも index.html に落とす
+    "not_found_handling": "single-page-application",
+    // API を Worker 側で先に処理する
+    "run_worker_first": ["/api/*"]
+  },
+
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "cryptbox-blobs",
+      "preview_bucket_name": "cryptbox-blobs-dev"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cryptbox",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ],
+
+  "triggers": {
+    // 自動削除: 10 分おきに期限切れ・回数上限到達のファイルを消す
+    "crons": ["*/10 * * * *"]
+  },
+
+  "vars": {
+    "MAX_FILE_SIZE": "107374182400"
+  }
+}
