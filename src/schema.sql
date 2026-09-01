@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS bundles (
   expires_at       INTEGER NOT NULL,
   max_downloads    INTEGER,               -- NULL = 無制限
   download_count   INTEGER NOT NULL DEFAULT 0,
-  last_claim_at    INTEGER,
+  -- 進行中のダウンロード数と最終アクティビティ。
+  -- 回数上限に達したバンドルは「アクティブ 0」または「アクティビティ途絶」で即削除する
+  active_downloads INTEGER NOT NULL DEFAULT 0,
+  last_activity_at INTEGER,
   file_count       INTEGER NOT NULL,
   total_plain_size INTEGER NOT NULL,
 

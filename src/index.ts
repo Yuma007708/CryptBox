@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env } from './env.js';
-import { GRANT_TTL_MS, UPLOAD_TTL_MS, maxFileSize } from './env.js';
+import { GRANT_TTL_MS, UPLOAD_TTL_MS, downloadGraceMs, maxFileSize } from './env.js';
 import {
   BadRequest,
   decodeFixed,
@@ -412,6 +412,7 @@ interface BundleRow {
   expires_at: number;
   max_downloads: number | null;
   download_count: number;
+  active_downloads: number;
   file_count: number;
   total_plain_size: number;
   kdf_salt: string;
@@ -453,7 +454,11 @@ async function authorize(env: Env, token: string, authToken: unknown): Promise<B
     throw new NotFound();
   }
   if (!timingSafeEqual(presented, row.auth_hash)) throw new NotFound();
-  if (row.expires_at <= Date.now()) throw new Gone('有効期限が切れています');
+  if (row.expires_at <= Date.now()) {
+    // 期限切れは Cron を待たず、アクセスされた時点で R2 ごと消す
+    await deleteBundle(env, row.id);
+    throw new Gone('有効期限が切れています');
+  }
   return row;
 }
 
@@ -538,7 +543,9 @@ app.post('/api/files/:token/claim', async (c) => {
   const now = Date.now();
   const claimed = await c.env.DB.prepare(
     `UPDATE bundles
-        SET download_count = download_count + 1, last_claim_at = ?
+        SET download_count = download_count + 1,
+            active_downloads = active_downloads + 1,
+            last_activity_at = ?
       WHERE id = ?
         AND expires_at > ?
         AND (max_downloads IS NULL OR download_count < max_downloads)`,
@@ -558,6 +565,57 @@ app.post('/api/files/:token/claim', async (c) => {
       : Math.max(0, bundle.max_downloads - bundle.download_count - 1);
 
   return c.json({ grant, grantExpiresAt: expiresAt, remainingDownloads: remaining });
+});
+
+/**
+ * ダウンロード中の生存信号。回数上限に達したバンドルは、この信号が
+ * 途絶えてから猶予時間が過ぎると Cron が削除する。
+ */
+app.post('/api/files/:token/ping', async (c) => {
+  const body = await readJson(c.req.raw);
+  const bundleId = await sha256Hex(c.req.param('token'));
+  if (typeof body.grant !== 'string' || !(await verifyGrant(c.env.GRANT_SECRET, body.grant, bundleId, Date.now()))) {
+    return c.json({ error: 'ダウンロード権限がありません' }, 403);
+  }
+  await c.env.DB.prepare(`UPDATE bundles SET last_activity_at = ? WHERE id = ?`)
+    .bind(Date.now(), bundleId)
+    .run();
+  return c.json({ ok: true });
+});
+
+/**
+ * ダウンロード完了（またはページ離脱）の通知。アクティブ数を減らし、
+ * 回数上限に達していてアクティブが 0 になった瞬間に完全削除する。
+ * これにより「最後の 1 回が終わったらすぐ消える」が成立する。
+ */
+app.post('/api/files/:token/finish', async (c) => {
+  const body = await readJson(c.req.raw);
+  const bundleId = await sha256Hex(c.req.param('token'));
+  if (typeof body.grant !== 'string' || !(await verifyGrant(c.env.GRANT_SECRET, body.grant, bundleId, Date.now()))) {
+    return c.json({ error: 'ダウンロード権限がありません' }, 403);
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE bundles
+        SET active_downloads = MAX(0, active_downloads - 1), last_activity_at = ?
+      WHERE id = ?`,
+  )
+    .bind(Date.now(), bundleId)
+    .run();
+
+  const row = await c.env.DB.prepare(
+    `SELECT max_downloads, download_count, active_downloads FROM bundles WHERE id = ?`,
+  )
+    .bind(bundleId)
+    .first<{ max_downloads: number | null; download_count: number; active_downloads: number }>();
+  if (!row) return c.json({ ok: true, deleted: true });
+
+  const exhausted = row.max_downloads !== null && row.download_count >= row.max_downloads;
+  if (exhausted && row.active_downloads <= 0) {
+    await deleteBundle(c.env, bundleId);
+    return c.json({ ok: true, deleted: true });
+  }
+  return c.json({ ok: true, deleted: false });
 });
 
 app.get('/api/files/:token/files/:file/blob', async (c) => {
@@ -676,17 +734,21 @@ export async function purge(
   env: Env,
   now = Date.now(),
 ): Promise<{ bundles: number; uploads: number }> {
-  // 期限切れ、またはダウンロード上限に達してグラント有効期間も過ぎたもの
+  const grace = downloadGraceMs(env);
+  // 期限切れ、またはダウンロード上限に達したもの。
+  // 上限到達後は finish 通知（アクティブ 0）で即座に、
+  // 通知が来ない場合も ping の途絶から猶予時間で削除する。
   const expired = await env.DB.prepare(
     `SELECT id FROM bundles
       WHERE expires_at <= ?
          OR (max_downloads IS NOT NULL
              AND download_count >= max_downloads
-             AND last_claim_at IS NOT NULL
-             AND last_claim_at + ? <= ?)
+             AND (active_downloads <= 0
+                  OR last_activity_at IS NULL
+                  OR last_activity_at + ? <= ?))
       LIMIT 200`,
   )
-    .bind(now, GRANT_TTL_MS, now)
+    .bind(now, grace, now)
     .all<{ id: string }>();
 
   for (const row of expired.results) {

@@ -6,7 +6,10 @@ import {
   claim,
   decryptedStream,
   fetchInfo,
+  finishDownload,
+  finishDownloadBeacon,
   openBundle,
+  pingDownload,
   WrongPassword,
   type BundleInfo,
   type Claim,
@@ -165,12 +168,53 @@ export function renderReceive(root: HTMLElement, token: string): void {
     clear(body);
     let grant: Claim | null = null;
     let busy = false;
+    let finished = false;
+    let lastPingAt = 0;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    const completed = new Set<number>();
+    const fileButtons: HTMLButtonElement[] = [];
 
     const ensureGrant = async (): Promise<Claim> => {
       if (grant && grant.grantExpiresAt > Date.now() + 60_000) return grant;
       grant = await claim(token, authToken, opened.pwVerifier);
+      // ページを開いている間は生存信号を送り続ける。
+      // 回数上限に達したバンドルは、この信号が途絶えるとサーバー側で削除される
+      pingTimer ??= setInterval(() => void sendPing(), 60_000);
       return grant;
     };
+
+    const sendPing = async (): Promise<void> => {
+      if (!grant || finished) return;
+      lastPingAt = Date.now();
+      await pingDownload(token, grant.grant).catch(() => undefined);
+    };
+
+    /** すべて完了 or ページ離脱で 1 回だけ呼ぶ。上限到達ならこの瞬間に完全削除される */
+    const sendFinish = async (): Promise<void> => {
+      if (!grant || finished) return;
+      finished = true;
+      if (pingTimer) clearInterval(pingTimer);
+      try {
+        const result = await finishDownload(token, grant.grant);
+        if (result.deleted) markDeleted();
+      } catch {
+        /* 削除は Cron が猶予時間後に引き継ぐ */
+      }
+    };
+
+    const markDeleted = (): void => {
+      for (const button of fileButtons) button.disabled = true;
+      downloadAll.disabled = true;
+      remaining.textContent =
+        'ダウンロード上限に達したため、このリンクのデータはサーバーから完全に削除されました。';
+    };
+
+    window.addEventListener('pagehide', () => {
+      if (grant && !finished) {
+        finished = true;
+        finishDownloadBeacon(token, grant.grant);
+      }
+    });
 
     const rows = h('div', {});
     const controls: Array<{ file: OpenedFile; run: (allowPicker: boolean) => Promise<void> }> = [];
@@ -221,6 +265,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
               const state = track(done);
               bar.style.width = `${(state.ratio * 100).toFixed(1)}%`;
               detail.textContent = state.text;
+              if (Date.now() - lastPingAt > 60_000) void sendPing();
             },
             onRetry: (attempt) => {
               detail.textContent = `接続が切れました。再開しています…（${attempt} 回目）`;
@@ -240,6 +285,8 @@ export function renderReceive(root: HTMLElement, token: string): void {
           if (granted.remainingDownloads !== null) {
             remaining.textContent = `残りダウンロード: ${granted.remainingDownloads} 回`;
           }
+          completed.add(entry.remote.index);
+          if (completed.size === opened.files.length) await sendFinish();
         } catch (error) {
           controller.abort();
           await saver.abort(error);
@@ -253,6 +300,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
       };
 
       button.addEventListener('click', () => void run(true));
+      fileButtons.push(button);
       controls.push({ file: entry, run });
 
       rows.append(

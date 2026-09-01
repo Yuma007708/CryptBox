@@ -314,6 +314,93 @@ describe('ダウンロード回数制限', () => {
   });
 });
 
+describe('回数到達時の完全削除', () => {
+  async function claimGrant(uploaded: Uploaded): Promise<string> {
+    const claimed = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
+    );
+    expect(claimed.status).toBe(200);
+    return ((await claimed.json()) as { grant: string }).grant;
+  }
+
+  it('最後の 1 回が finish した瞬間に R2 ごと消え、リンクも無効になる', async () => {
+    const uploaded = await upload([randomBytes(256), randomBytes(64)], { maxDownloads: 1 });
+    const keys = await env.DB.prepare('SELECT r2_key FROM bundle_files').all<{ r2_key: string }>();
+    const grant = await claimGrant(uploaded);
+
+    const finish = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/finish`, json({ grant }));
+    expect(finish.status).toBe(200);
+    expect(((await finish.json()) as { deleted: boolean }).deleted).toBe(true);
+
+    // R2 のオブジェクトも D1 の行も残っていない
+    for (const key of keys.results) expect(await env.BUCKET.head(key.r2_key)).toBeNull();
+    const rows = await env.DB.prepare('SELECT COUNT(*) AS n FROM bundles').first<{ n: number }>();
+    expect(rows?.n).toBe(0);
+
+    // リンクは無効
+    const info = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(uploaded.authToken) }),
+    );
+    expect(info.status).toBe(404);
+  });
+
+  it('上限に達していなければ finish しても消えない', async () => {
+    const uploaded = await upload([randomBytes(128)], { maxDownloads: 2 });
+    const grant = await claimGrant(uploaded);
+    const finish = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/finish`, json({ grant }));
+    expect(((await finish.json()) as { deleted: boolean }).deleted).toBe(false);
+
+    const info = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(uploaded.authToken) }),
+    );
+    expect(info.status).toBe(200);
+  });
+
+  it('finish が来なくても ping の途絶から猶予時間で purge が消す', async () => {
+    const uploaded = await upload([randomBytes(128)], { maxDownloads: 1 });
+    const grant = await claimGrant(uploaded);
+
+    // ダウンロード中（ping あり）は消えない
+    const ping = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/ping`, json({ grant }));
+    expect(ping.status).toBe(200);
+    expect((await purge(env, Date.now() + 60_000)).bundles).toBe(0);
+
+    // 途絶から 15 分（既定の猶予）を超えると消える
+    expect((await purge(env, Date.now() + 16 * 60_000)).bundles).toBe(1);
+  });
+
+  it('偽のグラントでは finish も ping もできない', async () => {
+    const uploaded = await upload([randomBytes(128)], { maxDownloads: 1 });
+    const finish = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/finish`,
+      json({ grant: 'x.y.z' }),
+    );
+    expect(finish.status).toBe(403);
+  });
+});
+
+describe('期限切れ時の完全削除', () => {
+  it('期限切れリンクへのアクセスで、その場で R2 ごと消える', async () => {
+    const uploaded = await upload([randomBytes(256)]);
+    const keys = await env.DB.prepare('SELECT r2_key FROM bundle_files').all<{ r2_key: string }>();
+
+    await env.DB.prepare('UPDATE bundles SET expires_at = ?').bind(Date.now() - 1000).run();
+
+    const info = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(uploaded.authToken) }),
+    );
+    expect(info.status).toBe(410);
+
+    for (const key of keys.results) expect(await env.BUCKET.head(key.r2_key)).toBeNull();
+    const rows = await env.DB.prepare('SELECT COUNT(*) AS n FROM bundles').first<{ n: number }>();
+    expect(rows?.n).toBe(0);
+  });
+});
+
 describe('レンジ取得', () => {
   it('206 と Content-Range を返す', async () => {
     const uploaded = await upload([randomBytes(1000)]);

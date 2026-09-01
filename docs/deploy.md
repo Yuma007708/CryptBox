@@ -69,8 +69,9 @@ curl -X PATCH "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/settings/min_
 
 ## 5. R2 のライフサイクルルール（自動削除の二重化）
 
-Worker の Cron（10 分間隔）が期限切れオブジェクトを削除しますが、
-取りこぼし（Cron の失敗、マルチパートの中断）に備えて R2 側にも保険を入れます。
+削除は 3 段構えです。①受信側の完了通知で即時削除、②毎分の Cron が
+期限切れ・生存信号の途絶えた回数超過バンドルを削除、③それでも
+取りこぼした場合（Cron の失敗、マルチパートの中断）に備えて R2 側にも保険を入れます。
 
 ダッシュボード → R2 → `cryptbox-blobs` → **Settings → Object lifecycle rules**:
 
@@ -111,8 +112,12 @@ curl "http://127.0.0.1:8787/cdn-cgi/local/scheduled"
 - **Workers**: リクエスト数と CPU 時間。本 Worker は暗号処理をしない
   （ブラウザ側で行う）ため CPU をほとんど使いません。
 
-## 上限を変える
+## 上限・猶予を変える
 
-`wrangler.jsonc` の `vars.MAX_FILE_SIZE`（バイト）を変更します。
+- `wrangler.jsonc` の `vars.MAX_FILE_SIZE`（バイト）: 1 バンドルの合計サイズ上限。
+- `vars.DOWNLOAD_GRACE_MINUTES`（分・既定 15）: 回数上限に達したバンドルを、
+  受信クライアントの生存信号が途絶えてから削除するまでの猶予。
+  正常系では完了通知により即時削除されるため、これはクラッシュ時の保険です。
+
 R2 マルチパートの上限は 10,000 パートなので、
 16 MiB チャンク × 10,000 = 約 156 GiB が構造上の最大値です。

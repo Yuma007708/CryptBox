@@ -130,6 +130,30 @@ export async function claim(
   });
 }
 
+/** ダウンロード中の生存信号。上限到達後の猶予タイマーをリセットする */
+export async function pingDownload(token: string, grant: string): Promise<void> {
+  await postJson(`/api/files/${encodeURIComponent(token)}/ping`, { grant });
+}
+
+/**
+ * ダウンロード完了（またはページ離脱）を通知する。
+ * 回数上限に達していれば、サーバーはこの時点でバンドルを完全削除する。
+ */
+export async function finishDownload(token: string, grant: string): Promise<{ deleted: boolean }> {
+  return postJson<{ deleted: boolean }>(`/api/files/${encodeURIComponent(token)}/finish`, {
+    grant,
+  });
+}
+
+/** ページ離脱時用。レスポンスを待たずに finish を送る */
+export function finishDownloadBeacon(token: string, grant: string): void {
+  const url = `/api/files/${encodeURIComponent(token)}/finish`;
+  const body = new Blob([JSON.stringify({ grant })], { type: 'application/json' });
+  if (!navigator.sendBeacon?.(url, body)) {
+    void fetch(url, { method: 'POST', body, keepalive: true }).catch(() => undefined);
+  }
+}
+
 /** チャンク i の暗号文の長さ */
 function cipherLengthOf(index: number, file: RemoteFile): number {
   const plainStart = index * file.chunkSize;
