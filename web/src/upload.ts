@@ -1,4 +1,6 @@
 import { postJson, putBytes, withRetry } from './api.js';
+import { PUBLIC_ORIGIN, apiUrl } from './config.js';
+import type { FileSource } from './filesource.js';
 import {
   deriveAuthToken,
   deriveKeys,
@@ -26,7 +28,7 @@ import {
 const CONCURRENCY = 3;
 
 export interface UploadOptions {
-  files: File[];
+  files: FileSource[];
   password: string;
   expiresIn: number;
   maxDownloads: number | null;
@@ -44,7 +46,7 @@ export interface UploadResult {
 }
 
 interface PreparedFile {
-  file: File;
+  file: FileSource;
   cek: CryptoKey;
   noncePrefix: Uint8Array;
   wrapNonce: Uint8Array;
@@ -116,7 +118,9 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
 
   const abortSession = async () => {
     try {
-      await fetch(`/api/uploads/${encodeURIComponent(session.uploadToken)}`, { method: 'DELETE' });
+      await fetch(apiUrl(`/api/uploads/${encodeURIComponent(session.uploadToken)}`), {
+        method: 'DELETE',
+      });
     } catch {
       /* 後始末は Cron でも行われる */
     }
@@ -144,7 +148,7 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
         const entry = prepared[task.fileIndex]!;
         const start = task.chunkIndex * chunkSize;
         const end = Math.min(entry.file.size, start + chunkSize);
-        const plain = new Uint8Array(await entry.file.slice(start, end).arrayBuffer());
+        const plain = await entry.file.read(start, end);
         const cipher = await encryptChunk(
           entry.cek,
           plain,
@@ -201,7 +205,7 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
     // 復号鍵はフラグメントに載せる = HTTP リクエストに含まれずサーバーには届かない
     const secret = toBase64Url(linkSecret);
     return {
-      url: `${location.origin}/d/${completed.token}#${secret}`,
+      url: `${PUBLIC_ORIGIN}/d/${completed.token}#${secret}`,
       token: completed.token,
       linkSecret: secret,
       expiresAt: completed.expiresAt,
@@ -210,5 +214,7 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
   } catch (error) {
     await abortSession();
     throw error;
+  } finally {
+    await Promise.all(prepared.map((entry) => entry.file.close().catch(() => undefined)));
   }
 }

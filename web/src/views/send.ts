@@ -5,6 +5,9 @@ import { addHistory, activeHistory, historyUrl } from '../history.js';
 import { getSettings } from '../settings.js';
 import { uploadBundle, type UploadResult } from '../upload.js';
 import { describeError, copyToClipboard, createTracker, navigate } from '../ui.js';
+import { fromFile, fromNativePath, type FileSource } from '../filesource.js';
+import { isNative } from '../platform.js';
+import { keepAwake, pickDocuments, pickMedia } from '../native.js';
 import { EXPIRY_OPTIONS, MAX_FILES_PER_BUNDLE } from '../../../shared/format.js';
 
 const DOWNLOAD_LIMITS: Array<{ label: string; value: number | null }> = [
@@ -31,7 +34,7 @@ export function renderSend(view: HTMLElement): void {
     password: '',
   };
 
-  let selected: File[] = [];
+  let selected: FileSource[] = [];
   let controller: AbortController | null = null;
 
   const left = h('div');
@@ -180,7 +183,7 @@ export function renderSend(view: HTMLElement): void {
     hidden: true,
     on: {
       change: () => {
-        addFiles(Array.from(fileInput.files ?? []));
+        addFiles(Array.from(fileInput.files ?? []).map(fromFile));
         fileInput.value = '';
       },
     },
@@ -202,15 +205,56 @@ export function renderSend(view: HTMLElement): void {
     'ファイルを選択',
   );
 
-  const dropzone = h(
+  /** アプリ版: ネイティブピッカーで選び、パスから FileSource を作る */
+  const pickNative = async (kind: 'media' | 'documents') => {
+    clearError();
+    try {
+      const picked = kind === 'media' ? await pickMedia() : await pickDocuments();
+      addFiles(picked.map((file) => fromNativePath(file)));
+    } catch (error) {
+      // ユーザーがキャンセルした場合はプラグインが reject するので黙って戻る
+      const message = describeError(error).toLowerCase();
+      if (message.includes('cancel')) return;
+      showError(describeError(error));
+    }
+  };
+
+  const nativePickers = h(
     'div',
-    { class: 'dropzone', on: { click: () => fileInput.click() } },
-    icon('upload'),
-    h('p', { class: 'dropzone-title' }, 'ファイルをドラッグ＆ドロップ'),
-    h('p', { class: 'dropzone-or' }, 'または'),
-    pickButton,
-    h('p', { class: 'dropzone-hint' }, `最大 ${MAX_FILES_PER_BUNDLE} ファイル・合計 100 GiB まで`),
+    { class: 'picker-row' },
+    h(
+      'button',
+      { type: 'button', class: 'primary', on: { click: () => void pickNative('media') } },
+      icon('file', 'icon-sm'),
+      '写真・動画',
+    ),
+    h(
+      'button',
+      { type: 'button', class: 'ghost', on: { click: () => void pickNative('documents') } },
+      icon('upload', 'icon-sm'),
+      'ファイル',
+    ),
   );
+
+  const dropzone = isNative
+    ? h(
+        'div',
+        { class: 'dropzone' },
+        icon('upload'),
+        h('p', { class: 'dropzone-title' }, '送るファイルを選ぶ'),
+        h('p', { class: 'dropzone-or' }, '写真・動画は元データのまま（無変換）で取り込みます'),
+        nativePickers,
+        h('p', { class: 'dropzone-hint' }, `最大 ${MAX_FILES_PER_BUNDLE} ファイル・合計 100 GiB まで`),
+      )
+    : h(
+        'div',
+        { class: 'dropzone', on: { click: () => fileInput.click() } },
+        icon('upload'),
+        h('p', { class: 'dropzone-title' }, 'ファイルをドラッグ＆ドロップ'),
+        h('p', { class: 'dropzone-or' }, 'または'),
+        pickButton,
+        h('p', { class: 'dropzone-hint' }, `最大 ${MAX_FILES_PER_BUNDLE} ファイル・合計 100 GiB まで`),
+      );
 
   for (const type of ['dragenter', 'dragover'] as const) {
     dropzone.addEventListener(type, (event) => {
@@ -223,21 +267,20 @@ export function renderSend(view: HTMLElement): void {
   }
   dropzone.addEventListener('drop', (event) => {
     event.preventDefault();
-    addFiles(Array.from(event.dataTransfer?.files ?? []));
+    addFiles(Array.from(event.dataTransfer?.files ?? []).map(fromFile));
   });
 
-  function addFiles(incoming: File[]): void {
+  function addFiles(incoming: FileSource[]): void {
     clearError();
-    const key = (file: File) => `${file.name}:${file.size}:${file.lastModified}`;
-    const seen = new Set(selected.map(key));
+    const seen = new Set(selected.map((file) => file.key));
     for (const file of incoming) {
-      if (seen.has(key(file))) continue;
+      if (seen.has(file.key)) continue;
       if (selected.length >= MAX_FILES_PER_BUNDLE) {
         showError(`1 度に送れるのは ${MAX_FILES_PER_BUNDLE} ファイルまでです`);
         break;
       }
       selected.push(file);
-      seen.add(key(file));
+      seen.add(file.key);
     }
     renderIdle();
   }
@@ -421,7 +464,7 @@ export function renderSend(view: HTMLElement): void {
     return { stage, bar, detail };
   }
 
-  function renderDone(result: UploadResult, files: File[]): void {
+  function renderDone(result: UploadResult, files: FileSource[]): void {
     clear(left);
     const urlInput = h('input', { type: 'text', readOnly: true, value: result.url });
 
@@ -511,6 +554,7 @@ export function renderSend(view: HTMLElement): void {
     const ui = renderUploading();
     const track = createTracker(totalSize);
     controller = new AbortController();
+    await keepAwake(true);
 
     try {
       const result = await uploadBundle({
@@ -547,6 +591,7 @@ export function renderSend(view: HTMLElement): void {
       renderIdle();
     } finally {
       controller = null;
+      await keepAwake(false);
     }
   }
 

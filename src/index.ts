@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env } from './env.js';
-import { GRANT_TTL_MS, UPLOAD_TTL_MS, downloadGraceMs, maxFileSize } from './env.js';
+import { GRANT_TTL_MS, UPLOAD_TTL_MS, downloadGraceMs, maxFileSize, allowedAppOrigins } from './env.js';
 import {
   BadRequest,
   decodeFixed,
@@ -37,11 +37,35 @@ const app = new Hono<{ Bindings: Env }>();
  * 共通
  * ------------------------------------------------------------------ */
 
+/**
+ * CORS: ブラウザ版は同一オリジンなので不要だが、
+ * スマホアプリ (Capacitor) は capacitor://localhost 等から API を呼ぶ。
+ * 許可リストにあるオリジンからの呼び出しにだけ CORS ヘッダーを返す。
+ */
 app.use('/api/*', async (c, next) => {
+  const origin = c.req.header('origin');
+  const allowed = origin !== undefined && allowedAppOrigins(c.env).has(origin);
+
+  if (c.req.method === 'OPTIONS') {
+    if (!allowed) return c.body(null, 403);
+    return c.body(null, 204, {
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range',
+      'Access-Control-Max-Age': '86400',
+      Vary: 'Origin',
+    });
+  }
+
   await next();
   c.res.headers.set('Cache-Control', 'no-store');
   c.res.headers.set('X-Content-Type-Options', 'nosniff');
   c.res.headers.set('Referrer-Policy', 'no-referrer');
+  if (allowed) {
+    c.res.headers.set('Access-Control-Allow-Origin', origin);
+    c.res.headers.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
+    c.res.headers.append('Vary', 'Origin');
+  }
 });
 
 app.onError((err, c) => {

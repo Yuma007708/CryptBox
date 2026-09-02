@@ -64,6 +64,9 @@ body {
 
 body {
   margin: 0;
+  /* ノッチやホームバーの内側に収める（アプリ版・iPhone Safari） */
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
   background: var(--bg);
   color: var(--text);
   font-family: system-ui, -apple-system, 'Hiragino Sans', 'Noto Sans JP', sans-serif;
@@ -323,9 +326,43 @@ body {
 
   .view,
   .topbar {
-    padding-left: 16px;
-    padding-right: 16px;
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
   }
+
+  .dropzone {
+    min-height: 200px;
+    padding: 24px 16px;
+  }
+
+  /* スマホでは押しやすい高さに */
+  button.primary,
+  button.ghost {
+    min-height: 44px;
+  }
+
+  .icon-button {
+    width: 40px;
+    height: 40px;
+  }
+}
+
+/* アプリ版: 2 つの選択ボタン（ファイル / 写真・動画） */
+.picker-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.saved-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 /* ------------------------------------------------------------------ *

@@ -1,3 +1,5 @@
+import { apiUrl } from './config.js';
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -19,7 +21,7 @@ async function toError(response: Response): Promise<ApiError> {
 }
 
 export async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiUrl(path), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -30,7 +32,7 @@ export async function postJson<T>(path: string, body: unknown, signal?: AbortSig
 }
 
 export async function deleteJson<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiUrl(path), {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -40,7 +42,7 @@ export async function deleteJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 export async function putBytes(path: string, body: Uint8Array, signal?: AbortSignal): Promise<void> {
-  const response = await fetch(path, {
+  const response = await fetch(apiUrl(path), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/octet-stream' },
     body: body as BodyInit,

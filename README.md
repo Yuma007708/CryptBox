@@ -73,6 +73,22 @@ SHA-256 が完全一致することを検証しています。
 送信履歴と設定は **この端末の localStorage にだけ** 保存されます。サーバーには残りません。
 履歴には復号鍵を含むリンクが入るため、共有端末では設定からオフにできます。
 
+## スマホアプリ版（iOS / Android）
+
+Web 版のフロントエンドを Capacitor で包んだアプリ版があります。
+写真・動画をネイティブピッカーで**無変換のまま**取り込み、復号したファイルは
+「ファイル」アプリ（iOS）/ `Documents/CryptBox`（Android）に保存します。
+アプリはコードを同梱するので、Web 版にある「配信サーバーが改竄されたら鍵を盗まれ得る」
+という弱点がなくなります。
+
+```bash
+VITE_API_BASE=https://cryptbox.example.com npm run cap:sync
+npm run android   # Android Studio を開く
+npm run ios       # Xcode を開く（macOS）
+```
+
+CI が push ごとにデバッグ APK を Artifacts に置きます。詳細は [docs/mobile.md](docs/mobile.md)。
+
 ## 暗号設計
 
 ```
@@ -185,7 +201,7 @@ npm run dev                      # http://127.0.0.1:8787
 ### テスト
 
 ```bash
-npm test        # Worker 結合テスト + 暗号テスト（40 件）
+npm test        # Worker 結合テスト + 暗号テスト + ネイティブ読み書き（50 件）
 npm run typecheck
 ```
 
