@@ -100,13 +100,15 @@ jobs:
           VITE_PUBLIC_ORIGIN: ${{ vars.CRYPTBOX_PUBLIC_ORIGIN || vars.CRYPTBOX_API_BASE || 'https://cryptbox.example.com' }}
         run: npm run build:native
 
-      - name: Web アセットをネイティブプロジェクトへ同期 (pod install を含む)
+      - name: Web アセットをネイティブプロジェクトへ同期
         run: npx cap sync ios
 
+      # Capacitor 8 の iOS は CocoaPods ではなく Swift Package Manager を使うため、
+      # .xcworkspace は無く App.xcodeproj を直接ビルドする（依存は xcodebuild が解決する）
       - name: シミュレータ向けビルド（署名なし）
         working-directory: ios/App
         run: |
-          xcodebuild -workspace App.xcworkspace -scheme App \
+          xcodebuild -project App.xcodeproj -scheme App \
             -configuration Debug -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO build

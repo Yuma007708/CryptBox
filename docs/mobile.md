@@ -67,9 +67,11 @@ Settings → Variables に `CRYPTBOX_API_BASE` を設定すると、その URL �
 
 ### iOS
 
-- 必要なもの: macOS + Xcode + CocoaPods（`sudo gem install cocoapods`）
+- 必要なもの: macOS + Xcode（CocoaPods は不要。Capacitor 8 は Swift Package Manager で
+  依存を解決するため、初回に Xcode がパッケージを取得します）
 - `npm run ios` で Xcode が開きます。Signing & Capabilities で Team を選び、実機で ▶
-- CI の `ios` ジョブ（手動起動）はシミュレータ向けに署名なしでビルドし、コンパイルが通ることを確認します
+- CI の `ios` ジョブ（手動起動）は `App.xcodeproj` をシミュレータ向けに署名なしでビルドし、
+  コンパイルが通ることを確認します
 
 `ios/App/App/Info.plist` には次を設定済みです:
 
