@@ -8,6 +8,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "skipLibCheck": true,
+    "types": ["vite/client"],
     "noEmit": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true

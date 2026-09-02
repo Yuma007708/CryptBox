@@ -1,3 +1,4 @@
+import { PUBLIC_ORIGIN } from './config.js';
 import { getSettings } from './settings.js';
 
 /**
@@ -55,7 +56,7 @@ export function clearHistory(): void {
 }
 
 export function historyUrl(entry: HistoryEntry): string {
-  return `${location.origin}/d/${entry.token}#${entry.linkSecret}`;
+  return `${PUBLIC_ORIGIN}/d/${entry.token}#${entry.linkSecret}`;
 }
 
 /** 期限切れのものを落として新しい順に返す */

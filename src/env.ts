@@ -14,6 +14,13 @@ export interface Env {
 
   /** 回数上限到達後、ping 途絶から削除までの猶予（分）。既定 15 分 */
   DOWNLOAD_GRACE_MINUTES?: string;
+
+  /**
+   * CORS を許可するオリジン（カンマ区切り）。
+   * Capacitor アプリは capacitor://localhost (iOS) / https://localhost (Android) から
+   * API を叩くため、未設定でもこの 2 つは許可する。
+   */
+  APP_ORIGINS?: string;
 }
 
 export const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024;
@@ -38,4 +45,15 @@ export function maxFileSize(env: Env): number {
 export function downloadGraceMs(env: Env): number {
   const minutes = Number(env.DOWNLOAD_GRACE_MINUTES);
   return Number.isFinite(minutes) && minutes > 0 ? minutes * 60 * 1000 : DEFAULT_DOWNLOAD_GRACE_MS;
+}
+
+const DEFAULT_APP_ORIGINS = ['capacitor://localhost', 'https://localhost', 'http://localhost'];
+
+/** スマホアプリなど、別オリジンから API を呼べるオリジンの集合 */
+export function allowedAppOrigins(env: Env): Set<string> {
+  const extra = (env.APP_ORIGINS ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  return new Set([...DEFAULT_APP_ORIGINS, ...extra]);
 }

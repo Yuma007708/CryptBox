@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">CryptBox</string>
+    <string name="title_activity_main">CryptBox</string>
+    <string name="package_name">com.cryptbox.app</string>
+    <string name="custom_url_scheme">com.cryptbox.app</string>
+</resources>

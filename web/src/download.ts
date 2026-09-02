@@ -1,4 +1,5 @@
 import { ApiError, deleteJson, postJson } from './api.js';
+import { apiUrl } from './config.js';
 import {
   decryptChunk,
   decryptMeta,
@@ -190,9 +191,10 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
   let buffered = 0;
 
   async function openStream(): Promise<void> {
-    const url =
+    const url = apiUrl(
       `/api/files/${encodeURIComponent(token)}/files/${file.index}/blob` +
-      `?g=${encodeURIComponent(grant)}`;
+        `?g=${encodeURIComponent(grant)}`,
+    );
     const response = await fetch(url, {
       headers: cipherOffset > 0 ? { Range: `bytes=${cipherOffset}-` } : {},
       signal,

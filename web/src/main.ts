@@ -2,6 +2,8 @@ import { clear, h } from './dom.js';
 import { brandMark, icon } from './icons.js';
 import { applyTheme, resolvedTheme, toggleTheme } from './settings.js';
 import { navigate } from './ui.js';
+import { applyStatusBar, onAppUrlOpen } from './native.js';
+import { isNative } from './platform.js';
 import { renderHelp } from './views/help.js';
 import { renderHistory } from './views/history.js';
 import { renderReceive } from './views/receive.js';
@@ -39,6 +41,7 @@ function themeButton(): HTMLElement {
   button.addEventListener('click', () => {
     toggleTheme();
     paint();
+    void applyStatusBar(resolvedTheme());
   });
   paint();
   return button;
@@ -123,3 +126,14 @@ function render(): void {
 
 window.addEventListener('popstate', render);
 render();
+
+if (isNative) {
+  void applyStatusBar(resolvedTheme());
+  // 共有リンク (https://host/d/<token>#<key>) でアプリが開かれたら受信画面へ。
+  // フラグメント (#key) は Universal Links / App Links でもアプリに渡される
+  void onAppUrlOpen((url) => {
+    if (!/^\/d\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) return;
+    history.pushState(null, '', url.pathname + url.hash);
+    render();
+  });
+}

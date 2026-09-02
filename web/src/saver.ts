@@ -1,12 +1,15 @@
 /**
  * 復号済みストリームをディスクに保存する。
  * 巨大ファイルをメモリに載せないため、上から順に試す:
+ *   0. ネイティブ (Capacitor)   … アプリ版。Filesystem プラグインで Documents に追記
  *   1. File System Access API   … 直接ファイルへ書き込む（Chromium 系）
  *   2. Service Worker ストリーム … ダウンロードを SW が生成する（Firefox / Safari）
  *   3. Blob                     … 上記が使えない環境向けの最終手段
  */
+import { isNative } from './platform.js';
+import { createNativeWriter } from './native.js';
 
-export type SaveMethod = 'fs-access' | 'service-worker' | 'blob';
+export type SaveMethod = 'fs-access' | 'service-worker' | 'blob' | 'native';
 
 export interface Saver {
   method: SaveMethod;
@@ -15,6 +18,10 @@ export interface Saver {
   /** 書き込み完了後の後始末（Blob 方式ではここで実際の保存が起きる） */
   finish(): Promise<void>;
   abort(reason?: unknown): Promise<void>;
+  /** アプリ版: 保存先の URI（共有シートに渡す） */
+  savedUri?: string;
+  /** アプリ版: 保存先の説明（UI 表示用） */
+  location?: string;
 }
 
 interface SaveFilePickerWindow extends Window {
@@ -28,7 +35,7 @@ let swRegistration: Promise<ServiceWorkerRegistration | null> | null = null;
 /** ページ表示時に呼んでおくと、保存時に待たされない */
 export function prepareServiceWorker(): Promise<ServiceWorkerRegistration | null> {
   if (swRegistration) return swRegistration;
-  if (!('serviceWorker' in navigator) || !window.isSecureContext) {
+  if (isNative || !('serviceWorker' in navigator) || !window.isSecureContext) {
     swRegistration = Promise.resolve(null);
     return swRegistration;
   }
@@ -68,6 +75,8 @@ export async function createSaver(
   size: number,
   options: { allowPicker?: boolean } = {},
 ): Promise<Saver> {
+  if (isNative) return createNativeSaver(filename);
+
   const picker = (window as SaveFilePickerWindow).showSaveFilePicker;
   if (options.allowPicker !== false && typeof picker === 'function') {
     const handle = await picker({ suggestedName: filename });
@@ -91,6 +100,29 @@ export async function createSaver(
   }
 
   return createBlobSaver(filename);
+}
+
+/** アプリ版: WebView にダウンロードの概念が無いので、ネイティブ側でファイルに追記する */
+async function createNativeSaver(filename: string): Promise<Saver> {
+  const writer = await createNativeWriter(filename);
+  const saver: Saver = {
+    method: 'native',
+    description: `復号しながら ${writer.location} に保存します`,
+    location: writer.location,
+    writable: new WritableStream<Uint8Array>({
+      write(chunk) {
+        return writer.append(chunk);
+      },
+    }),
+    async finish() {
+      const { uri } = await writer.finish();
+      saver.savedUri = uri;
+    },
+    async abort() {
+      await writer.abort();
+    },
+  };
+  return saver;
 }
 
 function createServiceWorkerSaver(filename: string, size: number): Saver {

@@ -497,3 +497,43 @@ describe('入力検証', () => {
     expect(response.status).toBe(400);
   });
 });
+
+describe('CORS（スマホアプリからの呼び出し）', () => {
+  it('Capacitor のオリジンからのプリフライトを許可する', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'capacitor://localhost',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type',
+      },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get('access-control-allow-origin')).toBe('capacitor://localhost');
+    expect(response.headers.get('access-control-allow-headers')).toContain('Range');
+  });
+
+  it('許可リストにないオリジンには CORS ヘッダーを返さない', async () => {
+    const preflight = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'POST' },
+    });
+    expect(preflight.status).toBe(403);
+
+    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      ...json({ chunkSize: CHUNK_SIZE, files: [{ plainSize: 10 }] }),
+      headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+    });
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('実リクエストにも Allow-Origin と Expose-Headers を付ける', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      ...json({ chunkSize: CHUNK_SIZE, files: [{ plainSize: 10 }] }),
+      headers: { 'Content-Type': 'application/json', Origin: 'https://localhost' },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('access-control-allow-origin')).toBe('https://localhost');
+    expect(response.headers.get('access-control-expose-headers')).toContain('Content-Range');
+  });
+});

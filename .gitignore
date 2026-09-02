@@ -3,3 +3,15 @@ web/dist/
 .wrangler/
 .dev.vars
 *.log
+
+# Capacitor (ネイティブプロジェクト内のビルド生成物)
+android/app/build/
+android/build/
+android/.gradle/
+android/app/src/main/assets/public/
+android/local.properties
+ios/App/Pods/
+ios/App/build/
+ios/App/App/public/
+ios/App/output/
+ios/DerivedData/

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -25,5 +26,87 @@ jobs:
       - name: フロントエンドのビルド
         run: npm run build:web
 
-      - name: テスト (Worker 結合 + 暗号)
+      - name: テスト (Worker 結合 + 暗号 + ネイティブ読み書き)
         run: npm test
+
+  # Android アプリ（デバッグ APK）。ubuntu ランナーには Android SDK が同梱されている。
+  # 生成された APK は Actions の Artifacts からダウンロードできる。
+  android:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 依存関係のインストール
+        run: npm ci
+
+      - name: アプリ用フロントエンドのビルド
+        # 実運用では Settings → Variables に CRYPTBOX_API_BASE を設定する
+        env:
+          VITE_API_BASE: ${{ vars.CRYPTBOX_API_BASE || 'https://cryptbox.example.com' }}
+          VITE_PUBLIC_ORIGIN: ${{ vars.CRYPTBOX_PUBLIC_ORIGIN || vars.CRYPTBOX_API_BASE || 'https://cryptbox.example.com' }}
+        run: npm run build:native
+
+      - name: Web アセットをネイティブプロジェクトへ同期
+        run: npx cap sync android
+
+      - name: Gradle キャッシュ
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: デバッグ APK のビルド
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cryptbox-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  # iOS（シミュレータ向け・署名なし）。macOS ランナーは高価なので手動起動のみ。
+  ios:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 依存関係のインストール
+        run: npm ci
+
+      - name: アプリ用フロントエンドのビルド
+        env:
+          VITE_API_BASE: ${{ vars.CRYPTBOX_API_BASE || 'https://cryptbox.example.com' }}
+          VITE_PUBLIC_ORIGIN: ${{ vars.CRYPTBOX_PUBLIC_ORIGIN || vars.CRYPTBOX_API_BASE || 'https://cryptbox.example.com' }}
+        run: npm run build:native
+
+      - name: Web アセットをネイティブプロジェクトへ同期 (pod install を含む)
+        run: npx cap sync ios
+
+      - name: シミュレータ向けビルド（署名なし）
+        working-directory: ios/App
+        run: |
+          xcodebuild -workspace App.xcworkspace -scheme App \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build

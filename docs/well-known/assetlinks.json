@@ -1,0 +1,10 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.cryptbox.app",
+      "sha256_cert_fingerprints": ["AA:BB:CC:...署名証明書の SHA-256 フィンガープリント..."]
+    }
+  }
+]

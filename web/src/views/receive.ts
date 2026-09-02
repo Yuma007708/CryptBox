@@ -17,6 +17,8 @@ import {
   type OpenedFile,
 } from '../download.js';
 import { createSaver, prepareServiceWorker, type Saver } from '../saver.js';
+import { keepAwake, shareFile } from '../native.js';
+import { isNative } from '../platform.js';
 import { fromBase64Url } from '../../../shared/format.js';
 import { createTracker, describeError } from '../ui.js';
 
@@ -223,6 +225,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
       const bar = h('div', { class: 'progress-bar' });
       const progress = h('div', { class: 'progress', hidden: true }, bar);
       const detail = h('p', { class: 'progress-detail', hidden: true });
+      const savedNote = h('div', { class: 'saved-note', hidden: true });
       const status = h('span', { class: 'file-size' }, formatBytes(entry.meta.size));
 
       const button = h('button', {
@@ -252,6 +255,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
         bar.style.width = '0%';
         const track = createTracker(entry.meta.size);
         const controller = new AbortController();
+        await keepAwake(true);
 
         try {
           const granted = await ensureGrant();
@@ -285,6 +289,23 @@ export function renderReceive(root: HTMLElement, token: string): void {
           if (granted.remainingDownloads !== null) {
             remaining.textContent = `残りダウンロード: ${granted.remainingDownloads} 回`;
           }
+          if (isNative && saver.savedUri) {
+            const uri = saver.savedUri;
+            clear(savedNote);
+            savedNote.append(
+              h('span', {}, `保存先: ${saver.location ?? ''}`),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'link',
+                  on: { click: () => void shareFile(uri, entry.meta.name).catch(() => undefined) },
+                },
+                '共有 / 他のアプリで開く',
+              ),
+            );
+            savedNote.hidden = false;
+          }
           completed.add(entry.remote.index);
           if (completed.size === opened.files.length) await sendFinish();
         } catch (error) {
@@ -296,6 +317,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
           showError(describeError(error));
         } finally {
           busy = false;
+          await keepAwake(false);
         }
       };
 
@@ -314,6 +336,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
             h('div', { class: 'file-name' }, entry.meta.name),
             progress,
             detail,
+            savedNote,
           ),
           status,
           button,
