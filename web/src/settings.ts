@@ -22,10 +22,20 @@ function read(): Settings {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { ...DEFAULTS };
-    return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Settings>) };
+    return sanitize({ ...DEFAULTS, ...(JSON.parse(raw) as Partial<Settings>) });
   } catch {
     return { ...DEFAULTS };
   }
+}
+
+/**
+ * 保存済みの値が現在の選択肢に無い場合は既定に戻す。
+ * 例: 以前の「30 日」は上限が 7 日になった時点で選択肢から外れ、
+ * そのまま送るとサーバーに 400 で拒否されるため。
+ */
+function sanitize(settings: Settings): Settings {
+  const validExpiry = EXPIRY_OPTIONS.some((option) => option.seconds === settings.defaultExpiry);
+  return validExpiry ? settings : { ...settings, defaultExpiry: DEFAULTS.defaultExpiry };
 }
 
 let current = read();
