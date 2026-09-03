@@ -1,4 +1,5 @@
 import { toBase64Url, fromBase64Url, textEncoder } from '../shared/format.js';
+import { receiptSigningString, type UnsignedDeletionReceipt } from '../shared/receipt.js';
 
 /** getRandomValues は 1 回あたり 64 KiB までなので分割して埋める */
 export function randomBytes(length: number): Uint8Array {
@@ -95,4 +96,57 @@ export async function verifyGrant(
     signature as BufferSource,
     textEncoder.encode(`${id}.${expText}`) as BufferSource,
   );
+}
+
+/**
+ * 削除レシートの署名鍵は GRANT_SECRET から HKDF-SHA256 で分けて派生させる。
+ * グラント署名（生の GRANT_SECRET を HMAC 鍵に使う）とは別系統にすることで、
+ * どちらかの用途が変わっても互いに影響しない。
+ */
+const RECEIPT_HKDF_INFO = 'cryptbox/receipt';
+
+async function receiptHmacKey(secret: string): Promise<CryptoKey> {
+  const ikm = await crypto.subtle.importKey(
+    'raw',
+    textEncoder.encode(secret) as BufferSource,
+    'HKDF',
+    false,
+    ['deriveBits'],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new Uint8Array(0),
+      info: textEncoder.encode(RECEIPT_HKDF_INFO) as BufferSource,
+    },
+    ikm,
+    256,
+  );
+  return crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, [
+    'sign',
+    'verify',
+  ]);
+}
+
+export async function signReceipt(
+  secret: string,
+  receipt: UnsignedDeletionReceipt,
+): Promise<string> {
+  const key = await receiptHmacKey(secret);
+  const sig = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    textEncoder.encode(receiptSigningString(receipt)) as BufferSource,
+  );
+  return toBase64Url(new Uint8Array(sig));
+}
+
+/** 署名を再計算して比較する（定数時間） */
+export async function verifyReceiptSignature(
+  secret: string,
+  receipt: UnsignedDeletionReceipt & { signature: string },
+): Promise<boolean> {
+  const expected = await signReceipt(secret, receipt);
+  return timingSafeEqual(expected, receipt.signature);
 }

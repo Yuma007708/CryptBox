@@ -1,9 +1,12 @@
 import { apiUrl } from './config.js';
+import type { DeletionReceipt } from '../../shared/receipt.js';
 
 export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** 期限切れ等で 410 が返るとき、サーバーが同梱する削除レシート */
+    readonly receipt: DeletionReceipt | null = null,
   ) {
     super(message);
   }
@@ -11,13 +14,15 @@ export class ApiError extends Error {
 
 async function toError(response: Response): Promise<ApiError> {
   let message = `HTTP ${response.status}`;
+  let receipt: DeletionReceipt | null = null;
   try {
-    const body = (await response.json()) as { error?: string };
+    const body = (await response.json()) as { error?: string; receipt?: DeletionReceipt };
     if (body.error) message = body.error;
+    if (body.receipt) receipt = body.receipt;
   } catch {
     /* JSON でないレスポンスはステータスだけ返す */
   }
-  return new ApiError(message, response.status);
+  return new ApiError(message, response.status, receipt);
 }
 
 export async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {

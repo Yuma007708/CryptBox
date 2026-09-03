@@ -26,6 +26,7 @@ import {
   toBase64Url,
   totalChunks,
 } from '../shared/format.js';
+import type { DeletionReceipt } from '../shared/receipt.js';
 
 const ORIGIN = 'https://cryptbox.test';
 const CHUNK_SIZE = 5 * 1024 * 1024;
@@ -535,5 +536,155 @@ describe('CORS（スマホアプリからの呼び出し）', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('access-control-allow-origin')).toBe('https://localhost');
     expect(response.headers.get('access-control-expose-headers')).toContain('Content-Range');
+  });
+});
+
+describe('削除レシート', () => {
+  async function verifyReceipt(receipt: unknown): Promise<boolean> {
+    const response = await SELF.fetch(`${ORIGIN}/api/receipts/verify`, json({ receipt }));
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { valid: boolean }).valid;
+  }
+
+  async function fetchReceipt(
+    token: string,
+  ): Promise<{ status: number; body: { deleted: boolean; receipt?: DeletionReceipt } }> {
+    const response = await SELF.fetch(`${ORIGIN}/api/files/${token}/receipt`, json({}));
+    return { status: response.status, body: (await response.json()) as never };
+  }
+
+  it('回数上限到達の finish はレシートを返し、署名も検証できる', async () => {
+    const uploaded = await upload([randomBytes(128), randomBytes(64)], { maxDownloads: 1 });
+    const claimed = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
+    );
+    const { grant } = (await claimed.json()) as { grant: string };
+
+    const finish = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/finish`, json({ grant }));
+    expect(finish.status).toBe(200);
+    const body = (await finish.json()) as { deleted: boolean; receipt: DeletionReceipt };
+    expect(body.deleted).toBe(true);
+    expect(body.receipt.reason).toBe('limit_reached');
+    expect(body.receipt.fileCount).toBe(2);
+    expect(await verifyReceipt(body.receipt)).toBe(true);
+  });
+
+  it('署名や理由を書き換えると検証に失敗する', async () => {
+    const uploaded = await upload([randomBytes(64)], { maxDownloads: 1 });
+    const claimed = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
+    );
+    const { grant } = (await claimed.json()) as { grant: string };
+    const finish = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}/finish`, json({ grant }));
+    const { receipt } = (await finish.json()) as { receipt: DeletionReceipt };
+
+    const tamperedSignature = { ...receipt, signature: `${receipt.signature.slice(0, -1)}x` };
+    expect(await verifyReceipt(tamperedSignature)).toBe(false);
+
+    const tamperedReason = { ...receipt, reason: 'expired' };
+    expect(await verifyReceipt(tamperedReason)).toBe(false);
+  });
+
+  it('送信者の即時削除は sender_deleted のレシートを残す', async () => {
+    const uploaded = await upload([randomBytes(256)]);
+    const deleted = await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken) }),
+    });
+    expect(deleted.status).toBe(200);
+    const deletedBody = (await deleted.json()) as { receipt: DeletionReceipt };
+    expect(deletedBody.receipt.reason).toBe('sender_deleted');
+
+    const { status, body } = await fetchReceipt(uploaded.token);
+    expect(status).toBe(200);
+    expect(body.deleted).toBe(true);
+    expect(body.receipt!.reason).toBe('sender_deleted');
+    expect(await verifyReceipt(body.receipt)).toBe(true);
+  });
+
+  it('期限切れへのアクセスは 410 の本文に expired のレシートを含む', async () => {
+    const uploaded = await upload([randomBytes(128)]);
+    await env.DB.prepare('UPDATE bundles SET expires_at = ?').bind(Date.now() - 1000).run();
+
+    const info = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/info`,
+      json({ authToken: toBase64Url(uploaded.authToken) }),
+    );
+    expect(info.status).toBe(410);
+    const infoBody = (await info.json()) as { receipt: DeletionReceipt };
+    expect(infoBody.receipt.reason).toBe('expired');
+    expect(await verifyReceipt(infoBody.receipt)).toBe(true);
+  });
+
+  it('cron 経由の期限切れ削除も expired のレシートを残す', async () => {
+    const uploaded = await upload([randomBytes(128)], { expiresIn: 3600 });
+    await purge(env, Date.now() + 3601 * 1000);
+
+    const { status, body } = await fetchReceipt(uploaded.token);
+    expect(status).toBe(200);
+    expect(body.deleted).toBe(true);
+    expect(body.receipt!.reason).toBe('expired');
+  });
+
+  it('cron 経由の回数上限削除も limit_reached のレシートを残す', async () => {
+    const uploaded = await upload([randomBytes(128)], { maxDownloads: 1 });
+    const claimed = await SELF.fetch(
+      `${ORIGIN}/api/files/${uploaded.token}/claim`,
+      json({ authToken: toBase64Url(uploaded.authToken), pwVerifier: null }),
+    );
+    expect(claimed.status).toBe(200);
+    await purge(env, Date.now() + 16 * 60_000);
+
+    const { body } = await fetchReceipt(uploaded.token);
+    expect(body.deleted).toBe(true);
+    expect(body.receipt!.reason).toBe('limit_reached');
+  });
+
+  it('未削除のバンドルは deleted: false、存在しないトークンは 404', async () => {
+    const uploaded = await upload([randomBytes(128)]);
+    const { status, body } = await fetchReceipt(uploaded.token);
+    expect(status).toBe(200);
+    expect(body.deleted).toBe(false);
+
+    const missing = await fetchReceipt(toBase64Url(randomBytes(32)));
+    expect(missing.status).toBe(404);
+  });
+
+  it('欠落・型不正なレシートは 400 ではなく valid: false を返す', async () => {
+    expect(await verifyReceipt({})).toBe(false);
+    expect(await verifyReceipt(null)).toBe(false);
+    expect(await verifyReceipt({ version: 2 })).toBe(false);
+  });
+
+  it('保持期間を過ぎたレシートは purge で消える', async () => {
+    const uploaded = await upload([randomBytes(64)]);
+    await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken) }),
+    });
+
+    const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM deletion_receipts').first<{
+      n: number;
+    }>();
+    expect(before?.n).toBe(1);
+
+    // 既定の保持期間 (90 日) より手前では消えない
+    await purge(env, Date.now() + 89 * 24 * 60 * 60 * 1000);
+    const stillThere = await env.DB.prepare('SELECT COUNT(*) AS n FROM deletion_receipts').first<{
+      n: number;
+    }>();
+    expect(stillThere?.n).toBe(1);
+
+    // 保持期間を過ぎると消える
+    const result = await purge(env, Date.now() + 91 * 24 * 60 * 60 * 1000);
+    expect(result.receipts).toBe(1);
+    const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM deletion_receipts').first<{
+      n: number;
+    }>();
+    expect(after?.n).toBe(0);
   });
 });

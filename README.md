@@ -46,6 +46,18 @@ https://example.com/d/<43文字のトークン>#<復号鍵>
 - 送信者は送信履歴の「今すぐ削除」で、期限前でも任意のタイミングで完全削除できます。
 - さらに保険として R2 のライフサイクルルール（[docs/deploy.md](docs/deploy.md)）を推奨します。
 
+### 削除レシート
+
+バンドルが削除される瞬間、**いつ・なぜ消えたか**を署名付きで D1 に記録します
+（`expired` = 期限切れ / `limit_reached` = ダウンロード上限到達 / `sender_deleted` = 送信者が削除）。
+送信履歴の「削除証明」、受信ページの削除後表示、`POST /api/files/:token/receipt` から確認できます。
+
+- 記録するのは **トークンのハッシュ・作成/削除時刻・理由・ファイル数・合計サイズ** だけです。
+  ファイル名・鍵・IP アドレスは含みません（詳細は [docs/security.md](docs/security.md)）。
+- レシートは `GRANT_SECRET` から HKDF-SHA256 で分離した鍵で HMAC-SHA256 署名しており、
+  `POST /api/receipts/verify` で（DB を見ずに）署名だけを再検証できます。
+- 保持期間は既定 90 日（`RECEIPT_RETENTION_DAYS` で変更可）。期限を過ぎると Cron が消します。
+
 ## なぜ「劣化ゼロ」なのか
 
 サーバーはファイルを **暗号化された不透明なバイト列としてしか見られません**。
@@ -167,6 +179,8 @@ docs/                デプロイ手順・脅威モデル
 | POST | `/api/files/:token/finish` | 完了通知。回数上限到達ならこの時点で完全削除（要グラント） |
 | GET | `/api/files/:token/files/:file/blob` | 暗号文の取得（Range 対応） |
 | DELETE | `/api/files/:token` | 即時削除 |
+| POST | `/api/files/:token/receipt` | 削除レシートの取得（トークンを知っていれば可） |
+| POST | `/api/receipts/verify` | 削除レシートの署名検証（DB は見ない） |
 
 ## セットアップ
 
