@@ -25,6 +25,12 @@ async function toError(response: Response): Promise<ApiError> {
   return new ApiError(message, response.status, receipt);
 }
 
+export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(apiUrl(path), { signal });
+  if (!response.ok) throw await toError(response);
+  return (await response.json()) as T;
+}
+
 export async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(apiUrl(path), {
     method: 'POST',

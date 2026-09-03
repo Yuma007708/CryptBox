@@ -13,7 +13,7 @@ const KEY = 'cryptbox.settings.v1';
 
 const DEFAULTS: Settings = {
   theme: 'system',
-  defaultExpiry: EXPIRY_OPTIONS[2]!.seconds, // 7 日
+  defaultExpiry: EXPIRY_OPTIONS[EXPIRY_OPTIONS.length - 1]!.seconds, // 7 日（選択肢の最長）
   defaultMaxDownloads: 10,
   keepHistory: true,
 };

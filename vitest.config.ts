@@ -15,7 +15,7 @@ export default defineConfig({
               r2Buckets: ['BUCKET'],
               bindings: {
                 GRANT_SECRET: 'test-grant-secret',
-                MAX_FILE_SIZE: String(1024 * 1024 * 1024),
+                MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
               },
             },
           }),

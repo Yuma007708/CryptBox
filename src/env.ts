@@ -6,8 +6,11 @@ export interface Env {
   /** ダウンロードグラントの署名鍵 (wrangler secret put GRANT_SECRET) */
   GRANT_SECRET: string;
 
-  /** 1 バンドルあたりの平文最大サイズ (バイト)。未設定なら 100 GiB */
+  /** 1 バンドルあたりの平文最大サイズ (バイト)。未設定なら 5 GiB */
   MAX_FILE_SIZE?: string;
+
+  /** リンクに設定できる有効期限の上限 (時間)。未設定なら 168 (7 日) */
+  MAX_EXPIRY_HOURS?: string;
 
   /** 設定された場合、アップロード API に Bearer トークンを要求する */
   UPLOAD_TOKEN?: string;
@@ -26,7 +29,10 @@ export interface Env {
   APP_ORIGINS?: string;
 }
 
-export const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024;
+export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
+
+/** リンクに設定できる有効期限の既定上限 (時間)。公開ホスト版はここまで */
+export const DEFAULT_MAX_EXPIRY_HOURS = 168;
 
 /** ダウンロードグラント（署名）の有効期間。巨大ファイルの転送中に切れないよう長めに取る */
 export const GRANT_TTL_MS = 12 * 60 * 60 * 1000;
@@ -43,6 +49,12 @@ export const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 export function maxFileSize(env: Env): number {
   const parsed = Number(env.MAX_FILE_SIZE);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_FILE_SIZE;
+}
+
+/** 許可される有効期限の上限 (時間) */
+export function maxExpiryHours(env: Env): number {
+  const parsed = Number(env.MAX_EXPIRY_HOURS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EXPIRY_HOURS;
 }
 
 export function downloadGraceMs(env: Env): number {
