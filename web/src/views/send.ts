@@ -10,6 +10,7 @@ import { isNative } from '../platform.js';
 import { keepAwake, pickDocuments, pickMedia } from '../native.js';
 import { EXPIRY_OPTIONS, MAX_FILES_PER_BUNDLE } from '../../../shared/format.js';
 import { getServerConfig } from '../server-config.js';
+import { createTurnstileWidget, type TurnstileWidget } from '../turnstile.js';
 
 /** /api/config が取れるまでの表示用フォールバック（サーバー既定値と同じ） */
 const FALLBACK_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
@@ -179,6 +180,22 @@ export function renderSend(view: HTMLElement): void {
     ),
   );
   right.append(optionsCard);
+
+  /* ---------------- Turnstile（見えないウィジェット） ---------------- */
+
+  const turnstileContainer = h('div', { class: 'turnstile-container' });
+  right.append(turnstileContainer);
+  let turnstileWidget: TurnstileWidget | null = null;
+  void getServerConfig().then((config) => {
+    if (!config.turnstileSiteKey) return;
+    createTurnstileWidget(turnstileContainer, config.turnstileSiteKey)
+      .then((widget) => {
+        turnstileWidget = widget;
+      })
+      .catch((error) => {
+        console.error('Turnstile の初期化に失敗しました', error);
+      });
+  });
 
   /* ---------------- 左カラム ---------------- */
 
@@ -569,11 +586,22 @@ export function renderSend(view: HTMLElement): void {
     await keepAwake(true);
 
     try {
+      let turnstileToken: string | undefined;
+      if (turnstileWidget) {
+        ui.stage.textContent = '認証しています…';
+        try {
+          turnstileToken = await turnstileWidget.getToken();
+        } catch (error) {
+          throw new Error(describeError(error) || '認証に失敗しました。ページを再読み込みしてください');
+        }
+      }
+
       const result = await uploadBundle({
         files,
         password: options.passwordEnabled ? options.password : '',
         expiresIn: options.expiresIn,
         maxDownloads: options.maxDownloads,
+        turnstileToken,
         signal: controller.signal,
         onStage: (text) => {
           ui.stage.textContent = text;

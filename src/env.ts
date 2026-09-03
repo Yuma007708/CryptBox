@@ -27,6 +27,21 @@ export interface Env {
    * API を叩くため、未設定でもこの 2 つは許可する。
    */
   APP_ORIGINS?: string;
+
+  /** Turnstile のサイトキー（公開値）。クライアントに `GET /api/config` で返す */
+  TURNSTILE_SITE_KEY?: string;
+
+  /**
+   * Turnstile のシークレット（wrangler secret put TURNSTILE_SECRET）。
+   * 未設定なら検証をスキップする（開発・セルフホストの既定）。
+   */
+  TURNSTILE_SECRET?: string;
+
+  /**
+   * IP あたりのアップロード回数を絞るレート制限 binding（Workers Rate Limiting）。
+   * 未設定（ローカル・セルフホストで binding を組んでいない場合）なら制限しない。
+   */
+  UPLOAD_LIMITER?: RateLimit;
 }
 
 export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
@@ -80,4 +95,9 @@ export function allowedAppOrigins(env: Env): Set<string> {
     .map((origin) => origin.trim())
     .filter(Boolean);
   return new Set([...DEFAULT_APP_ORIGINS, ...extra]);
+}
+
+/** クライアントに公開する Turnstile サイトキー。未設定なら Turnstile は無効 */
+export function turnstileSiteKey(env: Env): string | null {
+  return env.TURNSTILE_SITE_KEY?.trim() || null;
 }

@@ -34,6 +34,27 @@ openssl rand -base64 32 | npx wrangler secret put GRANT_SECRET
 npx wrangler secret put UPLOAD_TOKEN
 ```
 
+### Turnstile（公開ホスト版は必須。セルフホストは任意）
+
+無料公開する場合、送信 API (`POST /api/uploads`) を [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/)
+で保護します。**`TURNSTILE_SECRET` を設定しない限り検証はスキップされる**ため、
+セルフホストでは何もしなくても動きます。
+
+1. Cloudflare ダッシュボード → **Turnstile** → ウィジェットを追加。
+   - ドメイン: 公開ホスト名（例: `cryptbox.example.com`）
+   - ウィジェットモード: 任意（アプリ側は `appearance: 'interaction-only'` で明示的にレンダリングするため、
+     Managed / Invisible のどちらでも動く）
+2. 発行された **サイトキー**（公開値）を `wrangler.jsonc` の `vars.TURNSTILE_SITE_KEY` に書き、デプロイする。
+3. **シークレット**を Worker に設定する:
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET
+```
+
+以降、`GET /api/config` が `turnstileSiteKey` を返すようになり、フロントエンドが自動で
+ウィジェットを読み込みます。`TURNSTILE_SECRET` を設定した瞬間からサーバー側の検証が有効になるため、
+サイトキーとシークレットは同じタイミングで揃えてください（片方だけだと送信できなくなります）。
+
 ## 3. デプロイ
 
 ```bash
@@ -97,7 +118,29 @@ npx wrangler r2 bucket lifecycle add cryptbox-blobs \
   --name abort-multipart --abort-multipart-days 1
 ```
 
-## 6. 動作確認
+## 6. レート制限（POST /api/uploads）
+
+IP あたりのアップロード開始回数を [Workers Rate Limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+で絞っています。`wrangler.jsonc` の `ratelimits` に既定で入っており、**デプロイするだけで有効**です
+（無料プランでも使えます。`wrangler` 4.36 以降が必要）。
+
+```jsonc
+"ratelimits": [
+  { "name": "UPLOAD_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+]
+```
+
+- `limit` / `period`（秒。10 か 60 のみ）を変えて調整します。デプロイし直せば反映されます。
+- binding ごと削除すれば（`ratelimits` ブロックを丸ごと消す）制限なしに戻ります
+  （`c.env.UPLOAD_LIMITER` が undefined になり、コード側は自動的にスキップします）。
+- この binding は Worker インスタンス単位の近似カウントです。より厳密・大規模な制限や、
+  `/api/uploads` 以外のパスも含めた防御が要る場合はあわせて
+  ダッシュボードの **Security → WAF → Rate limiting rules** も検討してください
+  （対象パス `/api/uploads`、しきい値・期間は上と揃える、アクションは Block や
+  Managed Challenge）。WAF のレート制限は Cloudflare のエッジで Worker を呼ぶ前に効くため、
+  より安価に大量リクエストを弾けます。
+
+## 7. 動作確認
 
 ```bash
 curl -I https://<your-domain>/            # HSTS と CSP が付いているか

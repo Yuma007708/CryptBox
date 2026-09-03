@@ -9,3 +9,7 @@ GRANT_SECRET="ローカル開発用のランダムな文字列に置き換えて
 
 # リンクに設定できる有効期限の上限 (時間)。未設定なら 168 (7 日)。例: 30 日
 # MAX_EXPIRY_HOURS="720"
+
+# Cloudflare Turnstile のシークレット。未設定なら POST /api/uploads の検証をスキップする
+# （サイトキーは秘密ではないので wrangler.jsonc の vars.TURNSTILE_SITE_KEY に書く）
+# TURNSTILE_SECRET="ローカル開発用のテスト用シークレットに置き換えてください"

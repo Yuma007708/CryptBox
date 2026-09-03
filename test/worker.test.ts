@@ -553,9 +553,25 @@ describe('GET /api/config', () => {
   it('このホストの上限値を返す', async () => {
     const response = await SELF.fetch(`${ORIGIN}/api/config`);
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { maxFileSize: number; maxExpiryHours: number };
+    const body = (await response.json()) as {
+      maxFileSize: number;
+      maxExpiryHours: number;
+      turnstileSiteKey: string | null;
+    };
     expect(body.maxFileSize).toBe(5 * 1024 * 1024 * 1024);
     expect(body.maxExpiryHours).toBe(168);
+    // TURNSTILE_SITE_KEY 未設定（このプロジェクトの既定）なら null
+    expect(body.turnstileSiteKey).toBeNull();
+  });
+});
+
+describe('Turnstile (TURNSTILE_SECRET 未設定時)', () => {
+  it('turnstileToken を送らなくてもアップロードできる（検証をスキップ）', async () => {
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({ chunkSize: CHUNK_SIZE, files: [{ plainSize: 10 }] }),
+    );
+    expect(response.status).toBe(200);
   });
 });
 

@@ -8,6 +8,7 @@ import {
   maxExpiryHours,
   allowedAppOrigins,
   receiptRetentionMs,
+  turnstileSiteKey,
 } from './env.js';
 import {
   BadRequest,
@@ -113,6 +114,48 @@ function assertUploadAllowed(c: { req: { header: (name: string) => string | unde
   if (!timingSafeEqual(presented, expected)) throw new BadRequest('アップロードが許可されていません');
 }
 
+/**
+ * Cloudflare Turnstile のトークンを検証する。
+ * `TURNSTILE_SECRET` が未設定なら検証をスキップする（開発・セルフホストの既定）。
+ * ネットワークエラー・応答不正はすべて失敗（false）として扱う（fail-closed）。
+ */
+async function verifyTurnstile(
+  env: Env,
+  token: unknown,
+  remoteIp: string | undefined,
+): Promise<boolean> {
+  const secret = env.TURNSTILE_SECRET;
+  if (!secret) return true;
+  if (typeof token !== 'string' || token.length === 0) return false;
+
+  const form = new URLSearchParams({ secret, response: token });
+  if (remoteIp) form.set('remoteip', remoteIp);
+
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form,
+    });
+    if (!res.ok) return false;
+    const result = (await res.json()) as { success?: boolean };
+    return result.success === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * IP あたりのアップロード回数を絞る（Workers Rate Limiting）。
+ * `UPLOAD_LIMITER` binding が無ければ（ローカル・セルフホストの既定）制限しない。
+ */
+async function checkUploadRateLimit(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
+  if (!c.env.UPLOAD_LIMITER) return true;
+  const ip = c.req.header('cf-connecting-ip') ?? 'unknown';
+  const { success } = await c.env.UPLOAD_LIMITER.limit({ key: ip });
+  return success;
+}
+
 function requireInt(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw new BadRequest(`${field} が不正です`);
@@ -139,6 +182,7 @@ app.get('/api/config', (c) => {
   return c.json({
     maxFileSize: maxFileSize(c.env),
     maxExpiryHours: maxExpiryHours(c.env),
+    turnstileSiteKey: turnstileSiteKey(c.env),
   });
 });
 
@@ -162,7 +206,17 @@ interface UploadFileRow {
 
 app.post('/api/uploads', async (c) => {
   assertUploadAllowed(c);
+
+  if (!(await checkUploadRateLimit(c))) {
+    return c.json({ error: 'アップロードが多すぎます。しばらくしてから再度お試しください' }, 429);
+  }
+
   const body = await readJson(c.req.raw);
+
+  if (!(await verifyTurnstile(c.env, body.turnstileToken, c.req.header('cf-connecting-ip')))) {
+    return c.json({ error: '認証に失敗しました。ページを再読み込みしてもう一度お試しください' }, 403);
+  }
+
   const chunkSize = requireInt(body.chunkSize, 'chunkSize');
   if (chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE) {
     throw new BadRequest('chunkSize が許容範囲外です');

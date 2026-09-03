@@ -457,6 +457,11 @@ select {
   margin-top: 4px;
 }
 
+/* Turnstile は appearance: 'interaction-only' で、通常は何も表示しない */
+.turnstile-container:empty {
+  display: none;
+}
+
 .password-row input {
   width: 100%;
   padding-right: 40px;
