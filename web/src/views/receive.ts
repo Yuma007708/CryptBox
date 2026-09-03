@@ -100,7 +100,12 @@ export function renderReceive(root: HTMLElement, token: string): void {
     }
   }
 
-  function summaryOf(info: BundleInfo): HTMLElement {
+  function remainingText(remaining: number | null): string {
+    return remaining === null ? '無制限' : `${remaining} 回`;
+  }
+
+  /** @param remainingCell 残り回数の表示セル。完了後に更新するため呼び出し側が保持できる */
+  function summaryOf(info: BundleInfo, remainingCell?: HTMLElement): HTMLElement {
     return h(
       'dl',
       { class: 'summary' },
@@ -113,11 +118,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
         `${formatDateTime(info.expiresAt)}（残り ${formatDuration((info.expiresAt - Date.now()) / 1000)}）`,
       ),
       h('dt', {}, '残りダウンロード'),
-      h(
-        'dd',
-        {},
-        info.remainingDownloads === null ? '無制限' : `${info.remainingDownloads} 回`,
-      ),
+      remainingCell ?? h('dd', {}, remainingText(info.remainingDownloads)),
     );
   }
 
@@ -171,10 +172,12 @@ export function renderReceive(root: HTMLElement, token: string): void {
     let grant: Claim | null = null;
     let busy = false;
     let finished = false;
+    let deleted = false;
     let lastPingAt = 0;
     let pingTimer: ReturnType<typeof setInterval> | null = null;
     const completed = new Set<number>();
     const fileButtons: HTMLButtonElement[] = [];
+    const summaryRemaining = h('dd', {}, remainingText(info.remainingDownloads));
 
     const ensureGrant = async (): Promise<Claim> => {
       if (grant && grant.grantExpiresAt > Date.now() + 60_000) return grant;
@@ -205,10 +208,12 @@ export function renderReceive(root: HTMLElement, token: string): void {
     };
 
     const markDeleted = (): void => {
+      deleted = true;
       for (const button of fileButtons) button.disabled = true;
       downloadAll.disabled = true;
       remaining.textContent =
         'ダウンロード上限に達したため、このリンクのデータはサーバーから完全に削除されました。';
+      summaryRemaining.textContent = '0 回';
     };
 
     window.addEventListener('pagehide', () => {
@@ -288,6 +293,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
           button.append(icon('check', 'icon-sm'));
           if (granted.remainingDownloads !== null) {
             remaining.textContent = `残りダウンロード: ${granted.remainingDownloads} 回`;
+            summaryRemaining.textContent = remainingText(granted.remainingDownloads);
           }
           if (isNative && saver.savedUri) {
             const uri = saver.savedUri;
@@ -364,7 +370,8 @@ export function renderReceive(root: HTMLElement, token: string): void {
         for (const [index, control] of controls.entries()) {
           await control.run(controls.length === 1 || index === 0);
         }
-        downloadAll.disabled = false;
+        // 最後のファイル完了時に削除済みへ遷移していたら、再有効化しない
+        if (!deleted) downloadAll.disabled = false;
       })();
     });
 
@@ -391,7 +398,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
         'div',
         { class: 'card' },
         h('div', { class: 'card-head' }, h('h2', { class: 'card-title' }, 'このリンクについて')),
-        summaryOf(info),
+        summaryOf(info, summaryRemaining),
         h(
           'p',
           { class: 'hint' },
