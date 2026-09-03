@@ -39,7 +39,12 @@ export function receiptSigningString(receipt: UnsignedDeletionReceipt): string {
 }
 
 function isFiniteNonNegativeInt(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    !Object.is(value, -0)
+  );
 }
 
 /** API/クライアントの境界で受け取った値がレシートの形をしているかを確認する（未検証の署名は別） */

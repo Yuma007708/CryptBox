@@ -661,12 +661,27 @@ app.post('/api/files/:token/finish', async (c) => {
   return c.json({ ok: true, deleted: false });
 });
 
-/** バンドルの削除レシートを取得する。トークンを知っていること自体が認可（256bit の秘密） */
+/**
+ * バンドルの削除レシートを取得する。
+ * 共有 URL のパス部分（トークン）はログや Referer に残り得るため、他のエンドポイントと
+ * 同様に authToken（フラグメントの鍵からしか作れない）も必須にする。
+ */
 app.post('/api/files/:token/receipt', async (c) => {
+  const body = await readJson(c.req.raw);
+  const notFound = () => c.json({ error: 'ファイルが見つかりません' }, 404);
+
+  if (typeof body.authToken !== 'string') return notFound();
+  let presented: string;
+  try {
+    presented = await sha256Hex(fromBase64Url(body.authToken));
+  } catch {
+    return notFound();
+  }
+
   const bundleId = await sha256Hex(c.req.param('token'));
 
   const receiptRow = await c.env.DB.prepare(
-    `SELECT bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature
+    `SELECT bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature, auth_hash
        FROM deletion_receipts WHERE bundle_id = ?`,
   )
     .bind(bundleId)
@@ -678,9 +693,11 @@ app.post('/api/files/:token/receipt', async (c) => {
       file_count: number;
       total_plain_size: number;
       signature: string;
+      auth_hash: string;
     }>();
 
   if (receiptRow) {
+    if (!timingSafeEqual(presented, receiptRow.auth_hash)) return notFound();
     const receipt: DeletionReceipt = {
       version: 1,
       bundleId: receiptRow.bundle_id,
@@ -694,12 +711,15 @@ app.post('/api/files/:token/receipt', async (c) => {
     return c.json({ deleted: true, receipt });
   }
 
-  const bundle = await c.env.DB.prepare(`SELECT id FROM bundles WHERE id = ?`)
+  const bundle = await c.env.DB.prepare(`SELECT id, auth_hash FROM bundles WHERE id = ?`)
     .bind(bundleId)
-    .first<{ id: string }>();
-  if (bundle) return c.json({ deleted: false });
+    .first<{ id: string; auth_hash: string }>();
+  if (bundle) {
+    if (!timingSafeEqual(presented, bundle.auth_hash)) return notFound();
+    return c.json({ deleted: false });
+  }
 
-  return c.json({ error: 'ファイルが見つかりません' }, 404);
+  return notFound();
 });
 
 /** 削除レシートの署名検証。DB は見ず、署名を再計算するだけ */
@@ -783,10 +803,10 @@ async function deleteBundle(
   reason: DeletionReason,
 ): Promise<DeletionReceipt | null> {
   const bundle = await env.DB.prepare(
-    `SELECT created_at, file_count, total_plain_size FROM bundles WHERE id = ?`,
+    `SELECT created_at, file_count, total_plain_size, auth_hash FROM bundles WHERE id = ?`,
   )
     .bind(bundleId)
-    .first<{ created_at: number; file_count: number; total_plain_size: number }>();
+    .first<{ created_at: number; file_count: number; total_plain_size: number; auth_hash: string }>();
 
   const files = await env.DB.prepare(`SELECT r2_key FROM bundle_files WHERE bundle_id = ?`)
     .bind(bundleId)
@@ -816,14 +836,15 @@ async function deleteBundle(
     statements.push(
       env.DB.prepare(
         `INSERT INTO deletion_receipts
-           (bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+           (bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature, auth_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (bundle_id) DO UPDATE SET
            deleted_at = excluded.deleted_at,
            reason = excluded.reason,
            file_count = excluded.file_count,
            total_plain_size = excluded.total_plain_size,
-           signature = excluded.signature`,
+           signature = excluded.signature,
+           auth_hash = excluded.auth_hash`,
       ).bind(
         bundleId,
         unsigned.createdAt,
@@ -832,6 +853,7 @@ async function deleteBundle(
         unsigned.fileCount,
         unsigned.totalPlainSize,
         signature,
+        bundle.auth_hash,
       ),
     );
   }
@@ -927,10 +949,14 @@ export async function purge(
     ]);
   }
 
-  // 保持期間を過ぎた削除レシートを消す
+  // 保持期間を過ぎた削除レシートを消す。バンドル側 (LIMIT 200) に揃えて
+  // 1 回の cron で処理する件数を刻む。500 件を超える分は次回 cron に持ち越される
   const receiptCutoff = now - receiptRetentionMs(env);
   const purgedReceipts = await env.DB.prepare(
-    `DELETE FROM deletion_receipts WHERE deleted_at <= ?`,
+    `DELETE FROM deletion_receipts
+      WHERE bundle_id IN (
+        SELECT bundle_id FROM deletion_receipts WHERE deleted_at <= ? LIMIT 500
+      )`,
   )
     .bind(receiptCutoff)
     .run();

@@ -548,8 +548,12 @@ describe('削除レシート', () => {
 
   async function fetchReceipt(
     token: string,
+    authToken?: Uint8Array,
   ): Promise<{ status: number; body: { deleted: boolean; receipt?: DeletionReceipt } }> {
-    const response = await SELF.fetch(`${ORIGIN}/api/files/${token}/receipt`, json({}));
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/${token}/receipt`,
+      json(authToken ? { authToken: toBase64Url(authToken) } : {}),
+    );
     return { status: response.status, body: (await response.json()) as never };
   }
 
@@ -598,7 +602,7 @@ describe('削除レシート', () => {
     const deletedBody = (await deleted.json()) as { receipt: DeletionReceipt };
     expect(deletedBody.receipt.reason).toBe('sender_deleted');
 
-    const { status, body } = await fetchReceipt(uploaded.token);
+    const { status, body } = await fetchReceipt(uploaded.token, uploaded.authToken);
     expect(status).toBe(200);
     expect(body.deleted).toBe(true);
     expect(body.receipt!.reason).toBe('sender_deleted');
@@ -623,7 +627,7 @@ describe('削除レシート', () => {
     const uploaded = await upload([randomBytes(128)], { expiresIn: 3600 });
     await purge(env, Date.now() + 3601 * 1000);
 
-    const { status, body } = await fetchReceipt(uploaded.token);
+    const { status, body } = await fetchReceipt(uploaded.token, uploaded.authToken);
     expect(status).toBe(200);
     expect(body.deleted).toBe(true);
     expect(body.receipt!.reason).toBe('expired');
@@ -638,19 +642,42 @@ describe('削除レシート', () => {
     expect(claimed.status).toBe(200);
     await purge(env, Date.now() + 16 * 60_000);
 
-    const { body } = await fetchReceipt(uploaded.token);
+    const { body } = await fetchReceipt(uploaded.token, uploaded.authToken);
     expect(body.deleted).toBe(true);
     expect(body.receipt!.reason).toBe('limit_reached');
   });
 
   it('未削除のバンドルは deleted: false、存在しないトークンは 404', async () => {
     const uploaded = await upload([randomBytes(128)]);
-    const { status, body } = await fetchReceipt(uploaded.token);
+    const { status, body } = await fetchReceipt(uploaded.token, uploaded.authToken);
     expect(status).toBe(200);
     expect(body.deleted).toBe(false);
 
-    const missing = await fetchReceipt(toBase64Url(randomBytes(32)));
+    const missing = await fetchReceipt(toBase64Url(randomBytes(32)), randomBytes(32));
     expect(missing.status).toBe(404);
+  });
+
+  it('authToken が無い／不正だと 404（未削除・削除済みいずれも、共有 URL のパスだけでは取れない）', async () => {
+    const uploaded = await upload([randomBytes(64)]);
+
+    const noAuth = await fetchReceipt(uploaded.token);
+    expect(noAuth.status).toBe(404);
+    const wrongAuth = await fetchReceipt(uploaded.token, randomBytes(32));
+    expect(wrongAuth.status).toBe(404);
+
+    await SELF.fetch(`${ORIGIN}/api/files/${uploaded.token}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ authToken: toBase64Url(uploaded.authToken) }),
+    });
+
+    const noAuthDeleted = await fetchReceipt(uploaded.token);
+    expect(noAuthDeleted.status).toBe(404);
+    const wrongAuthDeleted = await fetchReceipt(uploaded.token, randomBytes(32));
+    expect(wrongAuthDeleted.status).toBe(404);
+    const rightAuthDeleted = await fetchReceipt(uploaded.token, uploaded.authToken);
+    expect(rightAuthDeleted.status).toBe(200);
+    expect(rightAuthDeleted.body.deleted).toBe(true);
   });
 
   it('欠落・型不正なレシートは 400 ではなく valid: false を返す', async () => {
@@ -686,5 +713,36 @@ describe('削除レシート', () => {
       n: number;
     }>();
     expect(after?.n).toBe(0);
+  });
+
+  it('保持期間切れが 500 件を超えると 1 回の purge では消しきれず、次回 cron に持ち越される', async () => {
+    const now = Date.now();
+    const deletedAt = now - 91 * 24 * 60 * 60 * 1000; // 保持期間 (既定 90 日) を過ぎている
+    const total = 501;
+    const writes = Array.from({ length: total }, (_, i) =>
+      env.DB.prepare(
+        `INSERT INTO deletion_receipts
+           (bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature, auth_hash)
+         VALUES (?, ?, ?, 'sender_deleted', 1, 1, 'sig', 'auth')`,
+      ).bind(`bundle-${i}`, deletedAt, deletedAt),
+    );
+    // D1.batch は一度に大量のステートメントを投げられないので分割する
+    for (let i = 0; i < writes.length; i += 100) {
+      await env.DB.batch(writes.slice(i, i + 100));
+    }
+
+    const countRows = async () =>
+      (
+        await env.DB.prepare('SELECT COUNT(*) AS n FROM deletion_receipts').first<{ n: number }>()
+      )?.n;
+    expect(await countRows()).toBe(total);
+
+    const first = await purge(env, now);
+    expect(first.receipts).toBe(500);
+    expect(await countRows()).toBe(1);
+
+    const second = await purge(env, now);
+    expect(second.receipts).toBe(1);
+    expect(await countRows()).toBe(0);
   });
 });

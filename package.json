@@ -47,7 +47,7 @@
     "build:web": "vite build --config web/vite.config.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
     "test": "vitest run",
-    "deploy": "npm run build:web && wrangler deploy",
+    "deploy": "npm run build:web && npm run db:init && wrangler deploy",
     "db:init": "wrangler d1 execute cryptbox --remote --file=src/schema.sql",
     "db:init:local": "wrangler d1 execute cryptbox --local --file=src/schema.sql",
     "build:native": "VITE_TARGET=native vite build --config web/vite.config.ts",

@@ -101,7 +101,8 @@ export async function verifyGrant(
 /**
  * 削除レシートの署名鍵は GRANT_SECRET から HKDF-SHA256 で分けて派生させる。
  * グラント署名（生の GRANT_SECRET を HMAC 鍵に使う）とは別系統にすることで、
- * どちらかの用途が変わっても互いに影響しない。
+ * レシート鍵が漏れてもグラント鍵は復元できない（HKDF は一方向）。
+ * ただし GRANT_SECRET 自体が漏れた場合はグラント署名・レシート署名の両方が影響を受ける。
  */
 const RECEIPT_HKDF_INFO = 'cryptbox/receipt';
 

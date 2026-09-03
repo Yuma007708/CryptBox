@@ -63,11 +63,14 @@ export async function deleteBundle(
   });
 }
 
-/** 削除レシートを取得する（トークンさえ分かれば認可される） */
+/** 削除レシートを取得する。他の API 同様、authToken（linkSecret 由来）による認可が要る */
 export async function fetchReceipt(
   token: string,
+  authToken: Uint8Array,
 ): Promise<{ deleted: boolean; receipt?: DeletionReceipt }> {
-  return postJson(`/api/files/${encodeURIComponent(token)}/receipt`, {});
+  return postJson(`/api/files/${encodeURIComponent(token)}/receipt`, {
+    authToken: toBase64Url(authToken),
+  });
 }
 
 /** DB を見ず署名だけを再検証する */

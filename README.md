@@ -55,8 +55,11 @@ https://example.com/d/<43文字のトークン>#<復号鍵>
 - 記録するのは **トークンのハッシュ・作成/削除時刻・理由・ファイル数・合計サイズ** だけです。
   ファイル名・鍵・IP アドレスは含みません（詳細は [docs/security.md](docs/security.md)）。
 - レシートは `GRANT_SECRET` から HKDF-SHA256 で分離した鍵で HMAC-SHA256 署名しており、
-  `POST /api/receipts/verify` で（DB を見ずに）署名だけを再検証できます。
+  `POST /api/receipts/verify` で（DB を見ずに）署名だけを再検証できます。ただし
+  `GRANT_SECRET` をローテーションすると、それ以前に発行済みのレシートは検証できなくなります。
 - 保持期間は既定 90 日（`RECEIPT_RETENTION_DAYS` で変更可）。期限を過ぎると Cron が消します。
+- `POST /api/files/:token/receipt` は他の API と同じく authToken（共有リンクの鍵から導出）が
+  必須です。トークンのパス部分だけを知っていても取得できません。
 
 ## なぜ「劣化ゼロ」なのか
 
@@ -179,7 +182,7 @@ docs/                デプロイ手順・脅威モデル
 | POST | `/api/files/:token/finish` | 完了通知。回数上限到達ならこの時点で完全削除（要グラント） |
 | GET | `/api/files/:token/files/:file/blob` | 暗号文の取得（Range 対応） |
 | DELETE | `/api/files/:token` | 即時削除 |
-| POST | `/api/files/:token/receipt` | 削除レシートの取得（トークンを知っていれば可） |
+| POST | `/api/files/:token/receipt` | 削除レシートの取得（authToken 必須） |
 | POST | `/api/receipts/verify` | 削除レシートの署名検証（DB は見ない） |
 
 ## セットアップ
@@ -197,7 +200,7 @@ npm run db:init
 # 3. グラント署名用のシークレットを登録
 openssl rand -base64 32 | npx wrangler secret put GRANT_SECRET
 
-# 4. デプロイ
+# 4. デプロイ（コード反映前にスキーマ適用が必要。npm run deploy は自動で行う）
 npm run deploy
 ```
 

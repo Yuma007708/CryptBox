@@ -45,7 +45,8 @@ export function renderHistory(view: HTMLElement): void {
       h('div', { class: 'card' }, h('div', { class: 'empty' }, h('div', { class: 'spinner' }), h('p', {}, '確認しています…'))),
     );
     try {
-      const result = await fetchReceipt(entry.token);
+      const authToken = await deriveAuthToken(fromBase64Url(entry.linkSecret));
+      const result = await fetchReceipt(entry.token, authToken);
       clear(receiptPanel);
       if (result.deleted && result.receipt) {
         receiptPanel.append(renderReceiptCard(result.receipt));
