@@ -42,7 +42,9 @@
     "MAX_FILE_SIZE": "5368709120",
     // リンクに設定できる有効期限の上限 (時間)。既定 168 (7 日)。
     // これを超える expiresIn / expiresAt はサーバーが 400 で拒否する
-    "MAX_EXPIRY_HOURS": "168"
+    "MAX_EXPIRY_HOURS": "168",
+    // 広告枠（ダミー）の表示。"1" で有効。広告ネットワークは未接続で、レイアウトのみ
+    "ADS_ENABLED": "0"
     // 削除レシートの保持期間（日）。未設定なら 90 日
     // "RECEIPT_RETENTION_DAYS": "90"
   }

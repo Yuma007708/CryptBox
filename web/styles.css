@@ -264,6 +264,46 @@ body {
   max-width: 820px;
 }
 
+/* ------------------------------------------------------------------ *
+ * 広告枠（ダミー）— ADS_ENABLED=1 のときだけ表示。広告ネットワーク未接続
+ * ------------------------------------------------------------------ */
+.ad-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+  max-width: 728px;
+  height: 90px;
+  margin: 0 auto;
+  background: var(--surface-2);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+  color: var(--muted);
+}
+
+.card + .ad-slot,
+.ad-slot + .card {
+  margin-top: 16px;
+}
+
+.ad-slot-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ad-slot-note {
+  font-size: 11px;
+}
+
+@media (max-width: 480px) {
+  .ad-slot {
+    max-width: 320px;
+    height: 100px;
+  }
+}
+
 .card-head {
   display: flex;
   align-items: center;

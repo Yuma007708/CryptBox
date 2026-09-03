@@ -8,6 +8,7 @@ import {
   maxExpiryHours,
   allowedAppOrigins,
   receiptRetentionMs,
+  adsEnabled,
 } from './env.js';
 import {
   BadRequest,
@@ -139,6 +140,7 @@ app.get('/api/config', (c) => {
   return c.json({
     maxFileSize: maxFileSize(c.env),
     maxExpiryHours: maxExpiryHours(c.env),
+    adsEnabled: adsEnabled(c.env),
   });
 });
 

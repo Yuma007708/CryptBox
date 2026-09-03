@@ -27,6 +27,9 @@ export interface Env {
    * API を叩くため、未設定でもこの 2 つは許可する。
    */
   APP_ORIGINS?: string;
+
+  /** "1" のとき広告枠（ダミー）を表示する。未設定なら無効 */
+  ADS_ENABLED?: string;
 }
 
 export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
@@ -55,6 +58,11 @@ export function maxFileSize(env: Env): number {
 export function maxExpiryHours(env: Env): number {
   const parsed = Number(env.MAX_EXPIRY_HOURS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EXPIRY_HOURS;
+}
+
+/** 広告枠（ダミー）を表示するか。広告ネットワークは未接続で、レイアウトのみ */
+export function adsEnabled(env: Env): boolean {
+  return env.ADS_ENABLED === '1';
 }
 
 export function downloadGraceMs(env: Env): number {

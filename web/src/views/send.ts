@@ -1,4 +1,5 @@
 import { clear, h } from '../dom.js';
+import { adSlot } from '../ads.js';
 import { extensionLabel, icon } from '../icons.js';
 import { formatBytes, formatDateTime, formatDuration, relativeTime } from '../format.js';
 import { addHistory, activeHistory, historyUrl } from '../history.js';
@@ -472,6 +473,7 @@ export function renderSend(view: HTMLElement): void {
           ),
         ),
       ),
+      adSlot('send-progress'),
     );
     return { stage, bar, detail };
   }

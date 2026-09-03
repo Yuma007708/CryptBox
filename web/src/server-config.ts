@@ -3,6 +3,7 @@ import { getJson } from './api.js';
 export interface ServerConfig {
   maxFileSize: number;
   maxExpiryHours: number;
+  adsEnabled: boolean;
 }
 
 /**
@@ -14,6 +15,7 @@ export interface ServerConfig {
 const FALLBACK: ServerConfig = {
   maxFileSize: 5 * 1024 * 1024 * 1024,
   maxExpiryHours: 168,
+  adsEnabled: false,
 };
 
 let cached: Promise<ServerConfig> | null = null;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { maxExpiryHours, maxFileSize, type Env } from '../../src/env.js';
+import { adsEnabled, maxExpiryHours, maxFileSize, type Env } from '../../src/env.js';
 
 /**
  * `MAX_FILE_SIZE` / `MAX_EXPIRY_HOURS` はセルフホスト者が環境変数で変える想定。
@@ -38,5 +38,14 @@ describe('maxExpiryHours', () => {
   it('不正な値（0 以下・非数値）は既定値にフォールバックする', () => {
     expect(maxExpiryHours(mockEnv({ MAX_EXPIRY_HOURS: '0' }))).toBe(168);
     expect(maxExpiryHours(mockEnv({ MAX_EXPIRY_HOURS: 'nope' }))).toBe(168);
+  });
+});
+
+describe('adsEnabled', () => {
+  it('ADS_ENABLED が "1" のときだけ true を返す（未設定・その他の値は無効）', () => {
+    expect(adsEnabled(mockEnv({}))).toBe(false);
+    expect(adsEnabled(mockEnv({ ADS_ENABLED: '0' }))).toBe(false);
+    expect(adsEnabled(mockEnv({ ADS_ENABLED: 'true' }))).toBe(false);
+    expect(adsEnabled(mockEnv({ ADS_ENABLED: '1' }))).toBe(true);
   });
 });

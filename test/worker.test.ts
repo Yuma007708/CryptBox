@@ -553,9 +553,14 @@ describe('GET /api/config', () => {
   it('このホストの上限値を返す', async () => {
     const response = await SELF.fetch(`${ORIGIN}/api/config`);
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { maxFileSize: number; maxExpiryHours: number };
+    const body = (await response.json()) as {
+      maxFileSize: number;
+      maxExpiryHours: number;
+      adsEnabled: boolean;
+    };
     expect(body.maxFileSize).toBe(5 * 1024 * 1024 * 1024);
     expect(body.maxExpiryHours).toBe(168);
+    expect(body.adsEnabled).toBe(false);
   });
 });
 
