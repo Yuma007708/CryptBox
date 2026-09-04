@@ -42,8 +42,30 @@
     "MAX_FILE_SIZE": "5368709120",
     // リンクに設定できる有効期限の上限 (時間)。既定 168 (7 日)。
     // これを超える expiresIn / expiresAt はサーバーが 400 で拒否する
-    "MAX_EXPIRY_HOURS": "168"
+    "MAX_EXPIRY_HOURS": "168",
+    // Turnstile のサイトキー（公開値）。空ならクライアントは Turnstile を読み込まない。
+    // シークレットは `wrangler secret put TURNSTILE_SECRET` で別途設定する
+    "TURNSTILE_SITE_KEY": "",
+    // 運営者名・連絡先（公開値）。GET /api/config で返す。空ならヘルプの節を省略する
+    "OPERATOR_NAME": "",
+    "OPERATOR_CONTACT": ""
     // 削除レシートの保持期間（日）。未設定なら 90 日
     // "RECEIPT_RETENTION_DAYS": "90"
-  }
+  },
+
+  // POST /api/uploads を IP あたり 10 回/分 に絞る（Workers Rate Limiting）。
+  // セルフホストで外したい場合はこのブロックごと削除する（binding が無ければ制限しない）
+  "ratelimits": [
+    {
+      "name": "UPLOAD_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    // POST /api/files/:token/report を IP あたり 5 回/分 に絞る
+    {
+      "name": "REPORT_LIMITER",
+      "namespace_id": "1002",
+      "simple": { "limit": 5, "period": 60 }
+    }
+  ]
 }

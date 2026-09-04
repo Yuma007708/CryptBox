@@ -79,6 +79,24 @@ export async function verifyReceipt(receipt: DeletionReceipt): Promise<boolean> 
   return result.valid;
 }
 
+export type ReportReason = 'malware' | 'illegal' | 'copyright' | 'other';
+
+/**
+ * このリンクを通報する。復号鍵は読まない（トークンだけで送れる）。
+ * 認証は不要 — 通報者はリンクを持っているだけの人。
+ */
+export async function reportBundle(
+  token: string,
+  reason: ReportReason,
+  detail: string,
+): Promise<void> {
+  await postJson(`/api/files/${encodeURIComponent(token)}/report`, {
+    reason,
+    detail: detail ? detail : undefined,
+  });
+}
+
+
 export interface OpenedFile {
   remote: RemoteFile;
   meta: FileMeta;

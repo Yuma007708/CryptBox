@@ -10,11 +10,13 @@ import {
   finishDownloadBeacon,
   openBundle,
   pingDownload,
+  reportBundle,
   WrongPassword,
   type BundleInfo,
   type Claim,
   type OpenedBundle,
   type OpenedFile,
+  type ReportReason,
 } from '../download.js';
 import { createSaver, prepareServiceWorker, type Saver } from '../saver.js';
 import { keepAwake, shareFile } from '../native.js';
@@ -41,6 +43,13 @@ export function renderReceive(root: HTMLElement, token: string): void {
     h('p', { class: 'receive-tagline' }, '暗号化して、安全に送る。'),
     alert,
     body,
+    // エラー画面・パスワード入力画面でも通報できるよう、シェル側に常時 1 つだけ置く
+    reportSection(),
+    h(
+      'p',
+      { class: 'receive-footer' },
+      h('a', { href: '/help#terms' }, '利用規約・プライバシー'),
+    ),
   );
   root.append(h('div', { class: 'receive' }, inner));
 
@@ -126,6 +135,81 @@ export function renderReceive(root: HTMLElement, token: string): void {
       h('dt', {}, '残りダウンロード'),
       remainingCell ?? h('dd', {}, remainingText(info.remainingDownloads)),
     );
+  }
+
+  const REPORT_REASONS: Array<{ value: ReportReason; label: string }> = [
+    { value: 'malware', label: 'マルウェア・不正なプログラム' },
+    { value: 'illegal', label: '違法なコンテンツ' },
+    { value: 'copyright', label: '著作権など他者の権利の侵害' },
+    { value: 'other', label: 'その他' },
+  ];
+
+  /**
+   * このリンクを通報する UI。復号鍵（location.hash）は読まない。
+   * トークンはパス由来なので、鍵を持っていない人でも通報できる。
+   */
+  function reportSection(): HTMLElement {
+    const openLink = h('button', { type: 'button', class: 'link' }, 'このリンクを通報');
+    const form = h('div', { class: 'report-form', hidden: true });
+    const container = h('div', { class: 'report-section' }, openLink, form);
+
+    openLink.addEventListener('click', () => {
+      openLink.hidden = true;
+      form.hidden = false;
+      renderForm();
+    });
+
+    function renderForm(): void {
+      clear(form);
+
+      const reasonSelect = h('select', { aria: { label: '通報の理由' } });
+      for (const reason of REPORT_REASONS) {
+        reasonSelect.append(h('option', { value: reason.value }, reason.label));
+      }
+
+      const detail = h('textarea', {
+        placeholder: '詳細（任意、500 文字まで）',
+        aria: { label: '通報の詳細（任意）' },
+      }) as HTMLTextAreaElement;
+      detail.maxLength = 500;
+      detail.rows = 3;
+
+      const submit = h('button', { type: 'button', class: 'primary' }, '通報する');
+      const cancel = h('button', { type: 'button', class: 'link' }, 'キャンセル');
+      const status = h('p', { class: 'hint', hidden: true });
+
+      cancel.addEventListener('click', () => {
+        form.hidden = true;
+        openLink.hidden = false;
+      });
+
+      submit.addEventListener('click', () => {
+        void (async () => {
+          submit.disabled = true;
+          status.hidden = true;
+          try {
+            await reportBundle(token, reasonSelect.value as ReportReason, detail.value.trim());
+            clear(form);
+            form.append(
+              h('p', { class: 'hint' }, '通報を受け付けました。内容は運営者が確認します。'),
+            );
+          } catch {
+            status.hidden = false;
+            status.textContent = '通報の送信に失敗しました。時間をおいて再度お試しください。';
+            submit.disabled = false;
+          }
+        })();
+      });
+
+      form.append(
+        h('div', { class: 'report-row' }, reasonSelect),
+        h('div', { class: 'report-row' }, detail),
+        status,
+        h('div', { class: 'card-actions' }, cancel, submit),
+      );
+    }
+
+    return container;
   }
 
   function renderPasswordPrompt(info: BundleInfo, authToken: Uint8Array): void {

@@ -436,6 +436,7 @@ body {
 }
 
 select,
+textarea,
 input[type='text'],
 input[type='password'],
 input[type='number'] {
@@ -452,9 +453,56 @@ select {
   cursor: pointer;
 }
 
+textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.report-section {
+  margin-top: 10px;
+}
+
+.receive-inner > .report-section {
+  margin-top: 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.receive-inner > .report-section .report-form {
+  width: 100%;
+  align-items: stretch;
+}
+
+.receive-footer {
+  margin: 14px 0 0;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.receive-footer a {
+  color: inherit;
+}
+
+.report-form {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.report-row {
+  display: flex;
+}
+
 .password-row {
   position: relative;
   margin-top: 4px;
+}
+
+/* Turnstile は appearance: 'interaction-only' で、通常は何も表示しない */
+.turnstile-container:empty {
+  display: none;
 }
 
 .password-row input {

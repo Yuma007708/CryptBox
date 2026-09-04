@@ -91,6 +91,16 @@ Settings → Variables に `CRYPTBOX_API_BASE` を設定すると、その URL �
 3. iOS: Xcode の Signing & Capabilities → Associated Domains に `applinks:<your-domain>` を追加
 4. Android: `AndroidManifest.xml` 内のコメントアウトされた `intent-filter` を有効化し、ホストを書く
 
+## Turnstile（濫用対策）について
+
+Web 版で `TURNSTILE_SITE_KEY` を設定していると、アプリ版の WebView（`capacitor://localhost` /
+`https://localhost`）でも同じフロントエンドコードが Turnstile を読み込もうとします。
+**この環境で実際に動くかは未検証です。** Turnstile はダッシュボードでウィジェットごとに
+許可ドメインを設定する仕組みのため、`capacitor://localhost` や `https://localhost` を
+そのドメイン一覧に追加する必要がある可能性があります（未確認）。うまく通らない場合は、
+アプリ版だけ `APP_ORIGINS` 相当の別ルートで Turnstile を迂回する対応が要るかもしれません。
+深追いはしていないので、実機で問題が出たら別途調査してください。
+
 ## 通信（CORS と TLS）
 
 アプリは `capacitor://localhost`（iOS）/ `https://localhost`（Android）というオリジンから
