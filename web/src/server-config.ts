@@ -5,6 +5,10 @@ export interface ServerConfig {
   maxExpiryHours: number;
   /** Cloudflare Turnstile のサイトキー。未設定（セルフホストで無効化）なら null */
   turnstileSiteKey: string | null;
+  /** 運営者名。未設定ならヘルプの「運営者情報」節を省略する */
+  operatorName: string | null;
+  /** 運営者の連絡先。未設定ならヘルプの「運営者情報」節を省略する */
+  operatorContact: string | null;
 }
 
 /**
@@ -17,6 +21,8 @@ const FALLBACK: ServerConfig = {
   maxFileSize: 5 * 1024 * 1024 * 1024,
   maxExpiryHours: 168,
   turnstileSiteKey: null,
+  operatorName: null,
+  operatorContact: null,
 };
 
 let cached: Promise<ServerConfig> | null = null;

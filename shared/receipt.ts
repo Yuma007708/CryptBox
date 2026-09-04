@@ -6,7 +6,7 @@
  *   v1|<bundleId>|<createdAt>|<deletedAt>|<reason>|<fileCount>|<totalPlainSize>
  */
 
-export const DELETION_REASONS = ['expired', 'limit_reached', 'sender_deleted'] as const;
+export const DELETION_REASONS = ['expired', 'limit_reached', 'sender_deleted', 'takedown'] as const;
 
 export type DeletionReason = (typeof DELETION_REASONS)[number];
 
@@ -75,5 +75,7 @@ export function describeDeletionReason(reason: DeletionReason): string {
       return 'ダウンロード上限に到達';
     case 'sender_deleted':
       return '送信者が削除';
+    case 'takedown':
+      return '運営者による削除';
   }
 }

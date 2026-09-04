@@ -69,3 +69,20 @@ describe('レート制限 (UPLOAD_LIMITER, 上限 3 回/分)', () => {
     expect((await post(ipv6B)).status).toBe(429);
   });
 });
+
+describe('レート制限 (REPORT_LIMITER, 上限 3 回/分)', () => {
+  const report = (ip: string): Promise<Response> =>
+    SELF.fetch(`${ORIGIN}/api/files/some-token/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ reason: 'malware' }),
+    });
+
+  it('上限内は通り、超えると 429', async () => {
+    const ip = '198.51.100.10';
+    for (let i = 0; i < 3; i++) {
+      expect((await report(ip)).status).toBe(200);
+    }
+    expect((await report(ip)).status).toBe(429);
+  });
+});
