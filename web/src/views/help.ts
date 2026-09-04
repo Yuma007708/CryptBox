@@ -1,6 +1,23 @@
 import { h } from '../dom.js';
+import { getServerConfig } from '../server-config.js';
 
 export function renderHelp(view: HTMLElement): void {
+  const operatorSection = h('div', { hidden: true });
+  void getServerConfig().then((config) => {
+    if (!config.operatorName && !config.operatorContact) return;
+    operatorSection.append(
+      h('h3', {}, '運営者情報'),
+      h(
+        'p',
+        {},
+        config.operatorName ? `運営者: ${config.operatorName}` : '',
+        config.operatorName && config.operatorContact ? h('br', {}) : null,
+        config.operatorContact ? `連絡先: ${config.operatorContact}` : '',
+      ),
+    );
+    operatorSection.hidden = false;
+  });
+
   view.append(
     h('h1', { class: 'view-title' }, 'ヘルプ'),
     h('p', { class: 'view-lead' }, 'CryptBox のしくみと、使うときの注意点。'),
@@ -50,6 +67,64 @@ export function renderHelp(view: HTMLElement): void {
         h('li', {}, 'ウイルススキャン（中身が見えないため原理的にできません）'),
         h('li', {}, '受信トレイやアカウント管理（本アプリはアカウントを持ちません）'),
       ),
+
+      h('h3', {}, '利用規約'),
+      h(
+        'p',
+        {},
+        '以下を禁止します: 違法なコンテンツの送信、マルウェア・不正なプログラムの配布、',
+        '他者の著作権など権利の侵害、その他本サービスの濫用。',
+      ),
+      h(
+        'p',
+        {},
+        '運営者はファイルの中身を見ることができません。そのため違反が疑われるリンクは、',
+        '通報にもとづき運営者が中身を確認せずリンク単位で無効化（即時完全削除）します。',
+      ),
+      h(
+        'p',
+        {},
+        '本サービスは無保証・自己責任で提供します。復号鍵を紛失した場合、',
+        'サーバーに鍵が存在しないためファイルを復元することはできません。',
+      ),
+
+      h('h3', {}, 'プライバシー'),
+      h('p', {}, 'サーバーが保持するもの:'),
+      h('ul', {},
+        h('li', {}, '暗号化されたファイル本体（中身は復元できません）'),
+        h('li', {}, '共有リンクのトークンの一方向ハッシュ（トークン自体は保存しません）'),
+        h('li', {}, 'ファイルサイズ・有効期限・ダウンロード回数などのメタデータ'),
+        h('li', {}, '通報を受け付けた場合はその内容（理由・任意の詳細）'),
+      ),
+      h('p', {}, 'サーバーが保持しないもの:'),
+      h('ul', {},
+        h('li', {}, '復号鍵（URL の「#」より後ろで、サーバーには送信されません）'),
+        h('li', {}, 'ファイル名・ファイルの中身'),
+        h('li', {}, 'アクセス元の IP アドレス（通報を含め記録しません）'),
+        h('li', {}, 'アカウント情報（本アプリはアカウントを持ちません）'),
+      ),
+      h(
+        'p',
+        {},
+        '広告枠が有効な場合、追跡型（パーソナライズ）広告は使用せず、Cookie も設置しません。',
+        'Cloudflare Turnstile を使用する場合、ページの読み込みに伴い Cloudflare にアクセス情報が渡ります。',
+      ),
+
+      h('h3', {}, '通報について'),
+      h(
+        'p',
+        {},
+        '受信ページの「このリンクを通報」から、理由（マルウェア・違法コンテンツ・著作権侵害・その他）と',
+        '任意の詳細を送って通報できます。通報に認証は不要です。',
+      ),
+      h(
+        'p',
+        {},
+        '運営者は通報にもとづき、ファイルの中身を確認せずにリンク単位でバンドルを即時完全削除できます。',
+        '通報の記録には IP アドレスなどの識別情報は含まれません。',
+      ),
+
+      operatorSection,
     ),
   );
 }

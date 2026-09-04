@@ -101,11 +101,31 @@ export default defineConfig({
               },
               ratelimits: {
                 UPLOAD_LIMITER: { namespace_id: '1', simple: { limit: 3, period: 60 } },
+                REPORT_LIMITER: { namespace_id: '2', simple: { limit: 3, period: 60 } },
               },
             },
           }),
         ],
         test: { name: 'ratelimit', include: ['test/abuse/ratelimit.test.ts'] },
+      },
+      {
+        // 運営者による無効化 API のみを対象にした結合テスト（ADMIN_TOKEN を設定）
+        plugins: [
+          cloudflareTest({
+            main: './src/index.ts',
+            miniflare: {
+              compatibilityDate: '2026-08-01',
+              d1Databases: ['DB'],
+              r2Buckets: ['BUCKET'],
+              bindings: {
+                GRANT_SECRET: 'test-grant-secret',
+                MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
+                ADMIN_TOKEN: 'test-admin-token',
+              },
+            },
+          }),
+        ],
+        test: { name: 'admin', include: ['test/abuse/admin.test.ts'] },
       },
       {
         // workerd は実行時の WebAssembly.compile を禁じているため、

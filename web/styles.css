@@ -436,6 +436,7 @@ body {
 }
 
 select,
+textarea,
 input[type='text'],
 input[type='password'],
 input[type='number'] {
@@ -450,6 +451,25 @@ input[type='number'] {
 select {
   min-width: 132px;
   cursor: pointer;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.report-section {
+  margin-top: 10px;
+}
+
+.report-form {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.report-row {
+  display: flex;
 }
 
 .password-row {

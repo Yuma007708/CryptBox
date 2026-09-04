@@ -10,6 +10,8 @@ import {
   receiptRetentionMs,
   turnstileSiteKey,
   turnstileHostnames,
+  operatorName,
+  operatorContact,
 } from './env.js';
 import {
   BadRequest,
@@ -211,6 +213,34 @@ export function rateLimitKey(ip: string | undefined): string {
   return `${prefixHextets.join(':')}::/64`;
 }
 
+/**
+ * IP あたりの通報回数を絞る（Workers Rate Limiting）。
+ * `REPORT_LIMITER` binding が無ければ（ローカル・セルフホストの既定）制限しない。
+ */
+async function checkReportRateLimit(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
+  if (!c.env.REPORT_LIMITER) return true;
+  const { success } = await c.env.REPORT_LIMITER.limit({ key: rateLimitKey(c.req.header('cf-connecting-ip')) });
+  return success;
+}
+
+/**
+ * 運営者による無効化 API (`/api/admin/*`) を保護する。
+ * `ADMIN_TOKEN` 未設定、または `Authorization: Bearer` が一致しなければ
+ * エンドポイント自体が存在しないかのように 404 を返す。
+ */
+function checkAdminAuth(c: { req: { header: (name: string) => string | undefined }; env: Env }): boolean {
+  const expected = c.env.ADMIN_TOKEN;
+  if (!expected) return false;
+  const header = c.req.header('authorization') ?? '';
+  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+  return timingSafeEqual(presented, expected);
+}
+
+const REPORT_REASONS = new Set(['malware', 'illegal', 'copyright', 'other']);
+
+/** 同一バンドルへの通報記録の上限（無限増殖防止。IP・UA は保存しない） */
+const MAX_REPORTS_PER_BUNDLE = 20;
+
 function requireInt(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw new BadRequest(`${field} が不正です`);
@@ -238,6 +268,8 @@ app.get('/api/config', (c) => {
     maxFileSize: maxFileSize(c.env),
     maxExpiryHours: maxExpiryHours(c.env),
     turnstileSiteKey: turnstileSiteKey(c.env),
+    operatorName: operatorName(c.env),
+    operatorContact: operatorContact(c.env),
   });
 });
 
@@ -626,7 +658,7 @@ async function authorize(env: Env, token: string, authToken: unknown): Promise<B
   if (!timingSafeEqual(presented, row.auth_hash)) throw new NotFound();
   if (row.expires_at <= Date.now()) {
     // 期限切れは Cron を待たず、アクセスされた時点で R2 ごと消す
-    const receipt = await deleteBundle(env, row.id, 'expired');
+    const { receipt } = await deleteBundle(env, row.id, 'expired');
     throw new Gone('有効期限が切れています', receipt);
   }
   return row;
@@ -782,7 +814,7 @@ app.post('/api/files/:token/finish', async (c) => {
 
   const exhausted = row.max_downloads !== null && row.download_count >= row.max_downloads;
   if (exhausted && row.active_downloads <= 0) {
-    const receipt = await deleteBundle(c.env, bundleId, 'limit_reached');
+    const { receipt } = await deleteBundle(c.env, bundleId, 'limit_reached');
     return c.json({ ok: true, deleted: true, receipt });
   }
   return c.json({ ok: true, deleted: false });
@@ -916,19 +948,34 @@ app.delete('/api/files/:token', async (c) => {
     if (res) return res;
     throw err;
   }
-  const receipt = await deleteBundle(c.env, bundle.id, 'sender_deleted');
-  return c.json({ ok: true, receipt });
+  const result = await deleteBundle(c.env, bundle.id, 'sender_deleted');
+  if (!result.ok) {
+    // R2 の削除が一部失敗。D1 の行はまだ残っているので、そのまま再試行すればよい（冪等）
+    return c.json({ ok: false, pending: result.pending }, 500);
+  }
+  return c.json({ ok: true, receipt: result.receipt });
 });
 
+interface DeleteBundleResult {
+  /** true なら R2 の全ファイルと D1 とも削除済み。false なら一部の R2 削除が失敗し、D1 はまだ残っている */
+  ok: boolean;
+  /** 削除に失敗した r2_key。ok:true なら空配列 */
+  pending: string[];
+  /** ok:true のときのレシート。bundles 行が既に存在しない（二重削除）場合は null */
+  receipt: DeletionReceipt | null;
+}
+
 /**
- * バンドルを R2 + D1 から完全削除し、同じ DB.batch 内で削除レシートを記録する。
- * bundles 行が既に存在しない（二重削除）場合はレシートを作らず null を返す。
+ * バンドルを R2 + D1 から完全削除する。冪等（同じ bundleId に何度呼んでもよい）。
+ * R2 の削除が 1 件でも失敗したら D1 の行は消さず、失敗したキーを pending として返す
+ * （中途半端に D1 だけ消えて R2 に孤児オブジェクトが残る事態を避ける）。
+ * R2 が全件消えたときだけ、同じ DB.batch 内で D1 削除と削除レシートの INSERT を行う。
  */
 async function deleteBundle(
   env: Env,
   bundleId: string,
   reason: DeletionReason,
-): Promise<DeletionReceipt | null> {
+): Promise<DeleteBundleResult> {
   const bundle = await env.DB.prepare(
     `SELECT created_at, file_count, total_plain_size, auth_hash FROM bundles WHERE id = ?`,
   )
@@ -938,9 +985,17 @@ async function deleteBundle(
   const files = await env.DB.prepare(`SELECT r2_key FROM bundle_files WHERE bundle_id = ?`)
     .bind(bundleId)
     .all<{ r2_key: string }>();
+
+  const pending: string[] = [];
   for (const file of files.results) {
-    await env.BUCKET.delete(file.r2_key);
+    try {
+      await env.BUCKET.delete(file.r2_key);
+    } catch (err) {
+      console.error(`R2 delete failed for ${file.r2_key}`, err);
+      pending.push(file.r2_key);
+    }
   }
+  if (pending.length > 0) return { ok: false, pending, receipt: null };
 
   const statements = [
     env.DB.prepare(`DELETE FROM bundle_files WHERE bundle_id = ?`).bind(bundleId),
@@ -986,8 +1041,117 @@ async function deleteBundle(
   }
 
   await env.DB.batch(statements);
-  return receipt;
+  return { ok: true, pending: [], receipt };
 }
+
+/* ------------------------------------------------------------------ *
+ * 通報 / 運営者による無効化
+ * ------------------------------------------------------------------ */
+
+/**
+ * 受信ページからの通報。認証不要（通報者はリンクを持っているだけの人）。
+ * 存在しないトークンでも同じ 200 を返す（存在オラクルにしない）。
+ */
+app.post('/api/files/:token/report', async (c) => {
+  if (!(await checkReportRateLimit(c))) {
+    return c.json({ error: '通報が多すぎます。しばらくしてから再度お試しください' }, 429);
+  }
+
+  const body = await readJson(c.req.raw);
+  if (typeof body.reason !== 'string' || !REPORT_REASONS.has(body.reason)) {
+    throw new BadRequest('reason が不正です');
+  }
+  let detail: string | null = null;
+  if (body.detail !== undefined && body.detail !== null) {
+    if (typeof body.detail !== 'string' || body.detail.length > 500) {
+      throw new BadRequest('detail が不正です（500 文字まで）');
+    }
+    detail = body.detail;
+  }
+
+  const bundleId = await sha256Hex(c.req.param('token'));
+  const countRow = await c.env.DB.prepare(`SELECT COUNT(*) as n FROM reports WHERE bundle_id = ?`)
+    .bind(bundleId)
+    .first<{ n: number }>();
+  const count = countRow?.n ?? 0;
+
+  if (count < MAX_REPORTS_PER_BUNDLE) {
+    await c.env.DB.prepare(
+      `INSERT INTO reports (bundle_id, reason, detail, reported_at) VALUES (?, ?, ?, ?)`,
+    )
+      .bind(bundleId, body.reason, detail, Date.now())
+      .run();
+  }
+
+  return c.json({ ok: true });
+});
+
+interface ReportRow {
+  id: number;
+  bundle_id: string;
+  reason: string;
+  detail: string | null;
+  reported_at: number;
+}
+
+/** 運営者向け: 未処理の通報一覧を新しい順に返す */
+app.get('/api/admin/reports', async (c) => {
+  if (!checkAdminAuth(c)) return c.json({ error: 'Not Found' }, 404);
+
+  const requested = Number(c.req.query('limit') ?? '50');
+  const limit = Number.isInteger(requested) && requested > 0 && requested <= 200 ? requested : 50;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT id, bundle_id, reason, detail, reported_at FROM reports
+      WHERE handled_at IS NULL
+      ORDER BY reported_at DESC
+      LIMIT ?`,
+  )
+    .bind(limit)
+    .all<ReportRow>();
+
+  return c.json({
+    reports: rows.results.map((row) => ({
+      id: row.id,
+      bundleId: row.bundle_id,
+      reason: row.reason,
+      detail: row.detail,
+      reportedAt: row.reported_at,
+    })),
+  });
+});
+
+/**
+ * 運営者向け: 中身を見ずにリンク単位でバンドルを即時完全削除する。
+ * 削除に成功したら、同じバンドルへの未処理の通報を処理済みにする。
+ */
+app.post('/api/admin/takedown', async (c) => {
+  if (!checkAdminAuth(c)) return c.json({ error: 'Not Found' }, 404);
+
+  const body = await readJson(c.req.raw);
+  if (!isHash(body.bundleId)) throw new BadRequest('bundleId が不正です');
+
+  const existing = await c.env.DB.prepare(`SELECT id FROM bundles WHERE id = ?`)
+    .bind(body.bundleId)
+    .first<{ id: string }>();
+
+  let deleted = false;
+  if (existing) {
+    const result = await deleteBundle(c.env, body.bundleId, 'takedown');
+    if (!result.ok) {
+      // R2 の削除が一部失敗。D1 の行はまだ残っているので、そのまま再試行すればよい（冪等）
+      return c.json({ ok: false, deleted: false, pending: result.pending });
+    }
+    deleted = true;
+    await c.env.DB.prepare(
+      `UPDATE reports SET handled_at = ? WHERE bundle_id = ? AND handled_at IS NULL`,
+    )
+      .bind(Date.now(), body.bundleId)
+      .run();
+  }
+
+  return c.json({ ok: true, deleted });
+});
 
 function parseRange(
   header: string | undefined,

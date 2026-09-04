@@ -94,3 +94,17 @@ CREATE TABLE IF NOT EXISTS deletion_receipts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deletion_receipts_deleted_at ON deletion_receipts (deleted_at);
+
+-- 通報。IP・UA は保存しない。中身は見えないのでリンク単位でしか止められない
+CREATE TABLE IF NOT EXISTS reports (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  bundle_id   TEXT NOT NULL,
+  reason      TEXT NOT NULL,
+  detail      TEXT,
+  reported_at INTEGER NOT NULL,
+  -- 運営者が takedown を実行した時刻。NULL = 未処理
+  handled_at  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_reports_bundle_id ON reports (bundle_id);
+CREATE INDEX IF NOT EXISTS idx_reports_handled_at ON reports (handled_at);

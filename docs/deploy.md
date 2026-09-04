@@ -72,6 +72,43 @@ npx wrangler secret put TURNSTILE_SECRET
 > （サイトキーが残っていてもクライアント側は動くので、フロントエンドの再デプロイは不要です）。
 > 失敗の原因は Worker のログに出る `error-codes`（`console.warn`）で確認できます。
 
+### 通報・無効化（公開ホスト版は必須。セルフホストは任意）
+
+無料公開する場合、受信ページの「このリンクを通報」を経由した通報を D1 の `reports` に記録し、
+運営者が中身を見ずにリンク単位でバンドルを即時完全削除できる管理 API を用意しています。
+**`ADMIN_TOKEN` を設定しない限り `/api/admin/*` は 404 を返し、存在しないかのように振る舞います。**
+
+```bash
+openssl rand -base64 32 | npx wrangler secret put ADMIN_TOKEN
+```
+
+運営者名・連絡先（ヘルプページに表示。任意）は `wrangler.jsonc` の `vars.OPERATOR_NAME` /
+`vars.OPERATOR_CONTACT` に書きます（シークレットではないので secret put は不要）。
+
+通報を確認する:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<your-domain>/api/admin/reports?limit=50"
+```
+
+`bundleId`（通報のハッシュ）を指定してリンクを無効化する:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"bundleId":"<reports 一覧の bundleId>"}' \
+  "https://<your-domain>/api/admin/takedown"
+```
+
+削除に成功すると `{"ok":true,"deleted":true}` が返り、同じ `bundleId` の未処理の通報は
+処理済みになって以降 `/api/admin/reports` には出てきません（存在しない `bundleId` の場合は
+`deleted:false`）。R2 のオブジェクトと D1 の行はこの時点で完全に削除され、復元できません。
+
+通報 API (`POST /api/files/:token/report`) にも IP あたりのレート制限を掛けたい場合、
+`wrangler.jsonc` の `ratelimits` に `REPORT_LIMITER` を追加します（既定で入っています）。
+挙動は 6 節の `UPLOAD_LIMITER` と同じです。
+
 ## 3. デプロイ
 
 ```bash
