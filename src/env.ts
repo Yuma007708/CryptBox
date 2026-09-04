@@ -30,6 +30,45 @@ export interface Env {
 
   /** "1" のとき広告枠（ダミー）を表示する。未設定なら無効 */
   ADS_ENABLED?: string;
+
+  /** Turnstile のサイトキー（公開値）。クライアントに `GET /api/config` で返す */
+  TURNSTILE_SITE_KEY?: string;
+
+  /**
+   * Turnstile のシークレット（wrangler secret put TURNSTILE_SECRET）。
+   * 未設定なら検証をスキップする（開発・セルフホストの既定）。
+   */
+  TURNSTILE_SECRET?: string;
+
+  /**
+   * siteverify レスポンスの `hostname` と照合する許可ホスト名（カンマ区切り）。
+   * 未設定なら hostname 検証をスキップする。
+   */
+  TURNSTILE_HOSTNAMES?: string;
+
+  /**
+   * IP あたりのアップロード回数を絞るレート制限 binding（Workers Rate Limiting）。
+   * 未設定（ローカル・セルフホストで binding を組んでいない場合）なら制限しない。
+   */
+  UPLOAD_LIMITER?: RateLimit;
+
+  /** IP あたりの通報回数を絞るレート制限 binding。未設定なら制限しない */
+  REPORT_LIMITER?: RateLimit;
+
+  /**
+   * 運営者による無効化 API (`/api/admin/*`) を保護するトークン
+   * (`wrangler secret put ADMIN_TOKEN`)。未設定なら管理 API は 404 として振る舞う。
+   */
+  ADMIN_TOKEN?: string;
+
+  /** `GET /api/config` で公開する運営者名。未設定ならヘルプの節を省略する */
+  OPERATOR_NAME?: string;
+
+  /** `GET /api/config` で公開する運営者の連絡先。未設定ならヘルプの節を省略する */
+  OPERATOR_CONTACT?: string;
+
+  /** 通報記録を保持する日数。未設定なら 90 日 */
+  REPORT_RETENTION_DAYS?: string;
 }
 
 export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
@@ -88,4 +127,37 @@ export function allowedAppOrigins(env: Env): Set<string> {
     .map((origin) => origin.trim())
     .filter(Boolean);
   return new Set([...DEFAULT_APP_ORIGINS, ...extra]);
+}
+
+/** クライアントに公開する Turnstile サイトキー。未設定なら Turnstile は無効 */
+export function turnstileSiteKey(env: Env): string | null {
+  return env.TURNSTILE_SITE_KEY?.trim() || null;
+}
+
+/** siteverify の hostname 照合に使う許可ホスト名の集合。未設定なら null（照合スキップ） */
+export function turnstileHostnames(env: Env): Set<string> | null {
+  const raw = (env.TURNSTILE_HOSTNAMES ?? '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean);
+  return raw.length > 0 ? new Set(raw) : null;
+}
+
+/** 運営者名。未設定ならヘルプの「運営者情報」節を省略する */
+export function operatorName(env: Env): string | null {
+  return env.OPERATOR_NAME?.trim() || null;
+}
+
+/** 運営者の連絡先。未設定ならヘルプの「運営者情報」節を省略する */
+export function operatorContact(env: Env): string | null {
+  return env.OPERATOR_CONTACT?.trim() || null;
+}
+
+/** 既定の通報保持日数 */
+export const DEFAULT_REPORT_RETENTION_DAYS = 90;
+
+/** 通報記録を保持する日数。未設定・不正な値なら既定 (90 日) */
+export function reportRetentionDays(env: Env): number {
+  const parsed = Number(env.REPORT_RETENTION_DAYS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REPORT_RETENTION_DAYS;
 }

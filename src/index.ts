@@ -9,6 +9,11 @@ import {
   allowedAppOrigins,
   receiptRetentionMs,
   adsEnabled,
+  turnstileSiteKey,
+  turnstileHostnames,
+  operatorName,
+  operatorContact,
+  reportRetentionDays,
 } from './env.js';
 import {
   BadRequest,
@@ -105,13 +110,145 @@ function errorResponse(err: unknown): Response | null {
   return null;
 }
 
+/** `Authorization: Bearer <token>` からトークンを取り出す。スキームは大文字小文字を問わない */
+function extractBearer(header: string): string {
+  const match = /^bearer\s+(.*)$/i.exec(header);
+  return match ? match[1]! : '';
+}
+
 /** アップロード API を閉じたい場合は UPLOAD_TOKEN を設定する */
 function assertUploadAllowed(c: { req: { header: (name: string) => string | undefined }; env: Env }) {
   const expected = c.env.UPLOAD_TOKEN;
   if (!expected) return;
-  const header = c.req.header('authorization') ?? '';
-  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const presented = extractBearer(c.req.header('authorization') ?? '');
   if (!timingSafeEqual(presented, expected)) throw new BadRequest('アップロードが許可されていません');
+}
+
+/** siteverify のレスポンス形。ドキュメントに無いフィールドを送ってくることもあるので緩めに扱う */
+interface SiteverifyResponse {
+  success?: boolean;
+  hostname?: string;
+  action?: string;
+  'error-codes'?: string[];
+}
+
+/** siteverify に送るトークンの長さ上限。Turnstile のトークンはこれより大幅に短い */
+const MAX_TOKEN_LENGTH = 2048;
+
+/**
+ * Cloudflare Turnstile のトークンを検証する。
+ * `TURNSTILE_SECRET` が未設定、または `TURNSTILE_SITE_KEY` が未設定（クライアントに
+ * サイトキーを配っていない = そもそもトークンを送れない片肺状態）なら検証をスキップする
+ * （開発・セルフホストの既定）。
+ * ネットワークエラー・応答不正はすべて失敗（false）として扱う（fail-closed）。
+ */
+async function verifyTurnstile(
+  env: Env,
+  token: unknown,
+  remoteIp: string | undefined,
+): Promise<boolean> {
+  const secret = env.TURNSTILE_SECRET;
+  if (!secret) return true;
+  if (!turnstileSiteKey(env)) return true;
+  if (typeof token !== 'string' || token.length === 0) return false;
+  if (token.length > MAX_TOKEN_LENGTH) return false;
+
+  const form = new URLSearchParams({ secret, response: token });
+  if (remoteIp) form.set('remoteip', remoteIp);
+
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return false;
+    const result = (await res.json()) as SiteverifyResponse;
+    if (result.success !== true) {
+      if (result['error-codes']?.length) {
+        console.warn('Turnstile siteverify failed', result['error-codes']);
+      }
+      return false;
+    }
+
+    const allowedHostnames = turnstileHostnames(env);
+    if (allowedHostnames && !(result.hostname !== undefined && allowedHostnames.has(result.hostname))) {
+      console.warn('Turnstile siteverify hostname mismatch', result.hostname);
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * IP あたりの回数を絞る（Workers Rate Limiting）。
+ * `limiter` が無ければ（ローカル・セルフホストの既定）制限しない。
+ */
+async function checkRateLimit(
+  c: { req: { header: (name: string) => string | undefined }; env: Env },
+  limiter: RateLimit | undefined,
+): Promise<boolean> {
+  if (!limiter) return true;
+  const key = rateLimitKey(c.req.header('cf-connecting-ip'));
+  const { success } = await limiter.limit({ key });
+  return success;
+}
+
+/**
+ * レート制限のキーに使う IP の正規化。
+ * IPv6 はホスト部が可変（同一利用者でも接続のたびに変わりうる）ため /64 プレフィックスに丸める。
+ * IPv4 やパース不能な値はそのまま使う。
+ */
+export function rateLimitKey(ip: string | undefined): string {
+  // 本番では Cloudflare が cf-connecting-ip を必ず付与するため、ここに来ることはない。
+  // 到達した場合は前段の構成（プロキシ・ローカル実行）に異常があるということ。
+  if (!ip) return 'unknown';
+  if (!ip.includes(':')) return ip;
+
+  const hextets = ip.split(':');
+  // "::" 短縮を含む IPv6 を /64 (先頭 4 hextet) に丸める。
+  // 短縮が無ければ先頭 4 個、あれば "::" より前の hextet を優先する。
+  const doubleColonIndex = ip.indexOf('::');
+  let prefixHextets: string[];
+  if (doubleColonIndex !== -1) {
+    const before = ip.slice(0, doubleColonIndex).split(':').filter(Boolean);
+    prefixHextets = [...before, ...Array(4).fill('0')].slice(0, 4);
+  } else {
+    prefixHextets = hextets.slice(0, 4);
+  }
+  return `${prefixHextets.join(':')}::/64`;
+}
+
+/**
+ * 運営者による無効化 API (`/api/admin/*`) を保護する。
+ * `ADMIN_TOKEN` 未設定、または `Authorization: Bearer` が一致しなければ
+ * エンドポイント自体が存在しないかのように 404 を返す。
+ * 提示値・期待値の両方を SHA-256 で固定長にしてから比較する
+ * （timingSafeEqual は長さが違うと即 false を返すため、長さの違いが漏れるのを防ぐ）。
+ */
+async function checkAdminAuth(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
+  const expected = c.env.ADMIN_TOKEN;
+  if (!expected) return false;
+  const presented = extractBearer(c.req.header('authorization') ?? '');
+  const [presentedHash, expectedHash] = await Promise.all([sha256Hex(presented), sha256Hex(expected)]);
+  return timingSafeEqual(presentedHash, expectedHash);
+}
+
+const REPORT_REASONS = new Set(['malware', 'illegal', 'copyright', 'other']);
+
+/** 通報の detail の最大文字数（コードポイント数え） */
+const MAX_DETAIL_CODEPOINTS = 500;
+
+/**
+ * 制御文字 (Cc) とサロゲート単体 (Cs) を空白に置換する。改行 (\n) だけは残す。
+ * 通報の detail は自由入力なので、ログ・DB に制御文字が紛れ込むのを防ぐ。
+ */
+function sanitizeDetail(raw: string): string {
+  return raw.replace(/[\p{Cc}\p{Cs}]/gu, (ch) => (ch === '\n' ? ch : ' '));
 }
 
 function requireInt(value: unknown, field: string): number {
@@ -141,6 +278,9 @@ app.get('/api/config', (c) => {
     maxFileSize: maxFileSize(c.env),
     maxExpiryHours: maxExpiryHours(c.env),
     adsEnabled: adsEnabled(c.env),
+    turnstileSiteKey: turnstileSiteKey(c.env),
+    operatorName: operatorName(c.env),
+    operatorContact: operatorContact(c.env),
   });
 });
 
@@ -164,7 +304,21 @@ interface UploadFileRow {
 
 app.post('/api/uploads', async (c) => {
   assertUploadAllowed(c);
+
+  if (!(await checkRateLimit(c, c.env.UPLOAD_LIMITER))) {
+    return c.json(
+      { error: 'アップロードが多すぎます。しばらくしてから再度お試しください' },
+      429,
+      { 'Retry-After': '60' },
+    );
+  }
+
   const body = await readJson(c.req.raw);
+
+  if (!(await verifyTurnstile(c.env, body.turnstileToken, c.req.header('cf-connecting-ip')))) {
+    return c.json({ error: '認証に失敗しました。ページを再読み込みしてもう一度お試しください' }, 403);
+  }
+
   const chunkSize = requireInt(body.chunkSize, 'chunkSize');
   if (chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE) {
     throw new BadRequest('chunkSize が許容範囲外です');
@@ -515,7 +669,7 @@ async function authorize(env: Env, token: string, authToken: unknown): Promise<B
   if (!timingSafeEqual(presented, row.auth_hash)) throw new NotFound();
   if (row.expires_at <= Date.now()) {
     // 期限切れは Cron を待たず、アクセスされた時点で R2 ごと消す
-    const receipt = await deleteBundle(env, row.id, 'expired');
+    const { receipt } = await deleteBundle(env, row.id, 'expired');
     throw new Gone('有効期限が切れています', receipt);
   }
   return row;
@@ -671,7 +825,7 @@ app.post('/api/files/:token/finish', async (c) => {
 
   const exhausted = row.max_downloads !== null && row.download_count >= row.max_downloads;
   if (exhausted && row.active_downloads <= 0) {
-    const receipt = await deleteBundle(c.env, bundleId, 'limit_reached');
+    const { receipt } = await deleteBundle(c.env, bundleId, 'limit_reached');
     return c.json({ ok: true, deleted: true, receipt });
   }
   return c.json({ ok: true, deleted: false });
@@ -805,19 +959,34 @@ app.delete('/api/files/:token', async (c) => {
     if (res) return res;
     throw err;
   }
-  const receipt = await deleteBundle(c.env, bundle.id, 'sender_deleted');
-  return c.json({ ok: true, receipt });
+  const result = await deleteBundle(c.env, bundle.id, 'sender_deleted');
+  if (!result.ok) {
+    // R2 の削除が一部失敗。D1 の行はまだ残っているので、そのまま再試行すればよい（冪等）
+    return c.json({ ok: false, pending: result.pending }, 500);
+  }
+  return c.json({ ok: true, receipt: result.receipt });
 });
 
+interface DeleteBundleResult {
+  /** true なら R2 の全ファイルと D1 とも削除済み。false なら一部の R2 削除が失敗し、D1 はまだ残っている */
+  ok: boolean;
+  /** 削除に失敗した r2_key。ok:true なら空配列 */
+  pending: string[];
+  /** ok:true のときのレシート。bundles 行が既に存在しない（二重削除）場合は null */
+  receipt: DeletionReceipt | null;
+}
+
 /**
- * バンドルを R2 + D1 から完全削除し、同じ DB.batch 内で削除レシートを記録する。
- * bundles 行が既に存在しない（二重削除）場合はレシートを作らず null を返す。
+ * バンドルを R2 + D1 から完全削除する。冪等（同じ bundleId に何度呼んでもよい）。
+ * R2 の削除が 1 件でも失敗したら D1 の行は消さず、失敗したキーを pending として返す
+ * （中途半端に D1 だけ消えて R2 に孤児オブジェクトが残る事態を避ける）。
+ * R2 が全件消えたときだけ、同じ DB.batch 内で D1 削除と削除レシートの INSERT を行う。
  */
 async function deleteBundle(
   env: Env,
   bundleId: string,
   reason: DeletionReason,
-): Promise<DeletionReceipt | null> {
+): Promise<DeleteBundleResult> {
   const bundle = await env.DB.prepare(
     `SELECT created_at, file_count, total_plain_size, auth_hash FROM bundles WHERE id = ?`,
   )
@@ -827,9 +996,17 @@ async function deleteBundle(
   const files = await env.DB.prepare(`SELECT r2_key FROM bundle_files WHERE bundle_id = ?`)
     .bind(bundleId)
     .all<{ r2_key: string }>();
+
+  const pending: string[] = [];
   for (const file of files.results) {
-    await env.BUCKET.delete(file.r2_key);
+    try {
+      await env.BUCKET.delete(file.r2_key);
+    } catch (err) {
+      console.error(`R2 delete failed for ${file.r2_key}`, err);
+      pending.push(file.r2_key);
+    }
   }
+  if (pending.length > 0) return { ok: false, pending, receipt: null };
 
   const statements = [
     env.DB.prepare(`DELETE FROM bundle_files WHERE bundle_id = ?`).bind(bundleId),
@@ -875,8 +1052,129 @@ async function deleteBundle(
   }
 
   await env.DB.batch(statements);
-  return receipt;
+  return { ok: true, pending: [], receipt };
 }
+
+/* ------------------------------------------------------------------ *
+ * 通報 / 運営者による無効化
+ * ------------------------------------------------------------------ */
+
+/**
+ * 受信ページからの通報。認証不要（通報者はリンクを持っているだけの人）。
+ * 存在しないトークンでも同じ 200 を返す（存在オラクルにしない）。
+ */
+app.post('/api/files/:token/report', async (c) => {
+  if (!(await checkRateLimit(c, c.env.REPORT_LIMITER))) {
+    return c.json({ error: '通報が多すぎます。しばらくしてから再度お試しください' }, 429);
+  }
+
+  const contentType = c.req.header('content-type') ?? '';
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    return c.json({ error: 'Content-Type は application/json にしてください' }, 415);
+  }
+
+  const body = await readJson(c.req.raw);
+  if (typeof body.reason !== 'string' || !REPORT_REASONS.has(body.reason)) {
+    throw new BadRequest('reason が不正です');
+  }
+  let detail: string | null = null;
+  if (body.detail !== undefined && body.detail !== null) {
+    if (typeof body.detail !== 'string' || [...body.detail].length > MAX_DETAIL_CODEPOINTS) {
+      throw new BadRequest(`detail が不正です（${MAX_DETAIL_CODEPOINTS} 文字まで）`);
+    }
+    detail = sanitizeDetail(body.detail);
+  }
+
+  const bundleId = await sha256Hex(c.req.param('token'));
+  // 同一バンドル・同一理由への通報は 1 行に集約し、件数だけ増やす。
+  // これにより行数は理由の種類数（4）で自然に上限化され、明示的な件数上限は不要。
+  // 応答パスにはバンドルの存在チェックを入れない（存在オラクルにしない）。
+  await c.env.DB.prepare(
+    `INSERT INTO reports (bundle_id, reason, detail, reported_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (bundle_id, reason) DO UPDATE SET
+       count = count + 1,
+       reported_at = excluded.reported_at,
+       detail = COALESCE(reports.detail, excluded.detail),
+       handled_at = NULL`,
+  )
+    .bind(bundleId, body.reason, detail, Date.now())
+    .run();
+
+  return c.json({ ok: true });
+});
+
+interface ReportRow {
+  id: number;
+  bundle_id: string;
+  reason: string;
+  /** 通報者入力の untrusted な文字列。UI に出す場合はエスケープ必須 */
+  detail: string | null;
+  count: number;
+  reported_at: number;
+}
+
+/** 運営者向け: 未処理の通報一覧を新しい順に返す */
+app.get('/api/admin/reports', async (c) => {
+  if (!(await checkAdminAuth(c))) return c.json({ error: 'Not Found' }, 404);
+
+  const requested = Number(c.req.query('limit') ?? '50');
+  const limit = Number.isInteger(requested) && requested > 0 && requested <= 200 ? requested : 50;
+
+  const rows = await c.env.DB.prepare(
+    `SELECT id, bundle_id, reason, detail, count, reported_at FROM reports
+      WHERE handled_at IS NULL
+      ORDER BY reported_at DESC
+      LIMIT ?`,
+  )
+    .bind(limit)
+    .all<ReportRow>();
+
+  return c.json({
+    reports: rows.results.map((row) => ({
+      id: row.id,
+      bundleId: row.bundle_id,
+      reason: row.reason,
+      detail: row.detail,
+      count: row.count,
+      reportedAt: row.reported_at,
+    })),
+  });
+});
+
+/**
+ * 運営者向け: 中身を見ずにリンク単位でバンドルを即時完全削除する。
+ * 削除に成功したら、同じバンドルへの未処理の通報を処理済みにする。
+ * R2 の削除が一部失敗した場合は D1 を消さず `{ ok: false, deleted: false, pending }` を返す
+ * （500 にはしない）。takedown は冪等なので、そのまま再実行すればよい。
+ */
+app.post('/api/admin/takedown', async (c) => {
+  if (!(await checkAdminAuth(c))) return c.json({ error: 'Not Found' }, 404);
+
+  const body = await readJson(c.req.raw);
+  if (!isHash(body.bundleId)) throw new BadRequest('bundleId が不正です');
+
+  const existing = await c.env.DB.prepare(`SELECT id FROM bundles WHERE id = ?`)
+    .bind(body.bundleId)
+    .first<{ id: string }>();
+
+  let deleted = false;
+  if (existing) {
+    const result = await deleteBundle(c.env, body.bundleId, 'takedown');
+    if (!result.ok) {
+      // R2 の削除が一部失敗。D1 の行はまだ残っているので、そのまま再試行すればよい（冪等）
+      return c.json({ ok: false, deleted: false, pending: result.pending });
+    }
+    deleted = true;
+    console.log(`takedown bundleId=${body.bundleId} at=${new Date().toISOString()}`);
+    await c.env.DB.prepare(
+      `UPDATE reports SET handled_at = ? WHERE bundle_id = ? AND handled_at IS NULL`,
+    )
+      .bind(Date.now(), body.bundleId)
+      .run();
+  }
+
+  return c.json({ ok: true, deleted });
+});
 
 function parseRange(
   header: string | undefined,
@@ -915,10 +1213,24 @@ app.get('*', (c) => c.env.ASSETS.fetch(c.req.raw));
  * 自動削除 (Cron Trigger)
  * ------------------------------------------------------------------ */
 
+/** D1 (SQLite) の 1 クエリあたりの変数上限に収まるチャンクサイズ */
+const DELETE_CHUNK_SIZE = 100;
+
+/** id の配列を `DELETE FROM <table> WHERE id IN (...)` で一括削除する（変数上限のためチャンク分割） */
+async function deleteByIds(env: Env, table: 'reports', ids: number[]): Promise<void> {
+  for (let offset = 0; offset < ids.length; offset += DELETE_CHUNK_SIZE) {
+    const chunk = ids.slice(offset, offset + DELETE_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(',');
+    await env.DB.prepare(`DELETE FROM ${table} WHERE id IN (${placeholders})`)
+      .bind(...chunk)
+      .run();
+  }
+}
+
 export async function purge(
   env: Env,
   now = Date.now(),
-): Promise<{ bundles: number; uploads: number; receipts: number }> {
+): Promise<{ bundles: number; uploads: number; receipts: number; reports: number }> {
   const grace = downloadGraceMs(env);
   // 期限切れ、またはダウンロード上限に達したもの。
   // 上限到達後は finish 通知（アクティブ 0）で即座に、
@@ -977,10 +1289,26 @@ export async function purge(
     .bind(receiptCutoff)
     .run();
 
+  // 保持期間を超えた通報。分割削除（1 回の purge で最大 500 件）。
+  // 残りは次回の Cron 実行で引き継がれる。
+  const retentionCutoff = now - reportRetentionDays(env) * 24 * 60 * 60 * 1000;
+  const oldReports = await env.DB.prepare(`SELECT id FROM reports WHERE reported_at <= ? LIMIT 500`)
+    .bind(retentionCutoff)
+    .all<{ id: number }>();
+  await deleteByIds(env, 'reports', oldReports.results.map((row) => row.id));
+
+  // バンドルが（takedown・期限切れ等で）既に消えている通報。応答パスでは存在チェックを
+  // 一切しない（存在オラクルにしないため）ので、ここで定期的に掃除する。
+  const orphanReports = await env.DB.prepare(
+    `SELECT id FROM reports WHERE bundle_id NOT IN (SELECT id FROM bundles) LIMIT 500`,
+  ).all<{ id: number }>();
+  await deleteByIds(env, 'reports', orphanReports.results.map((row) => row.id));
+
   return {
     bundles: expired.results.length,
     uploads: stale.results.length,
     receipts: purgedReceipts.meta.changes ?? 0,
+    reports: oldReports.results.length + orphanReports.results.length,
   };
 }
 
@@ -990,7 +1318,7 @@ export default {
     ctx.waitUntil(
       purge(env).then((result) => {
         console.log(
-          `purged bundles=${result.bundles} uploads=${result.uploads} receipts=${result.receipts}`,
+          `purged bundles=${result.bundles} uploads=${result.uploads} receipts=${result.receipts} reports=${result.reports}`,
         );
       }),
     );

@@ -15,5 +15,6 @@
     "allowImportingTsExtensions": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*.ts", "shared/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "shared/**/*.ts", "test/**/*.ts"],
+  "exclude": ["test/web/**"]
 }

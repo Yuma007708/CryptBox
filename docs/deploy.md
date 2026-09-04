@@ -34,6 +34,87 @@ openssl rand -base64 32 | npx wrangler secret put GRANT_SECRET
 npx wrangler secret put UPLOAD_TOKEN
 ```
 
+### Turnstile（公開ホスト版は必須。セルフホストは任意）
+
+無料公開する場合、送信 API (`POST /api/uploads`) を [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/)
+で保護します。**`TURNSTILE_SECRET` を設定しない限り検証はスキップされる**ため、
+セルフホストでは何もしなくても動きます。
+
+**手順の順序が重要です**（サイトキーを先に、シークレットを後に）。逆順にすると、
+シークレットが有効になった瞬間からサーバーがトークンを要求するのに、
+クライアントはまだサイトキーを持たずウィジェットを出せない「片肺」の時間帯ができ、
+その間は誰も送信できません。
+
+1. Cloudflare ダッシュボード → **Turnstile** → ウィジェットを追加。
+   - ドメイン: 公開ホスト名（例: `cryptbox.example.com`）
+   - ウィジェットモード: 任意（アプリ側は `appearance: 'interaction-only'` で明示的にレンダリングするため、
+     Managed / Invisible のどちらでも動く）
+2. 発行された **サイトキー**（公開値）を `wrangler.jsonc` の `vars.TURNSTILE_SITE_KEY` に書き、
+   **`wrangler deploy` を完了させる**（`npm run deploy` でも可）。
+3. デプロイが終わってから **シークレット**を Worker に設定する:
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET
+```
+
+以降、`GET /api/config` が `turnstileSiteKey` を返すようになり、フロントエンドが自動で
+ウィジェットを読み込みます。`TURNSTILE_SECRET` を設定した瞬間からサーバー側の検証が有効になります。
+
+> **安全弁**: サーバー側は `TURNSTILE_SECRET` が設定されていても `TURNSTILE_SITE_KEY` が
+> 未設定なら検証をスキップします（サイトキーを配っていなければクライアントはそもそも
+> トークンを送れないため）。上記の順序を守れなくても送信不能にはなりませんが、
+> 検証は無効なままなので早めにサイトキーを設定してください。
+
+> **fail-closed のトレードオフ**: Turnstile 検証は fail-closed（`challenges.cloudflare.com`
+> への通信が失敗・タイムアウトした場合も 403 を返す）です。Turnstile 自体が障害を起こすと
+> アップロードが全面的に止まります。緊急でアップロードを復旧させたい場合は
+> `npx wrangler secret delete TURNSTILE_SECRET` で検証をスキップに戻せます
+> （サイトキーが残っていてもクライアント側は動くので、フロントエンドの再デプロイは不要です）。
+> 失敗の原因は Worker のログに出る `error-codes`（`console.warn`）で確認できます。
+
+### 通報・無効化（公開ホスト版は必須。セルフホストは任意）
+
+無料公開する場合、受信ページの「このリンクを通報」を経由した通報を D1 の `reports` に記録し、
+運営者が中身を見ずにリンク単位でバンドルを即時完全削除できる管理 API を用意しています。
+**`ADMIN_TOKEN` を設定しない限り `/api/admin/*` は 404 を返し、存在しないかのように振る舞います。**
+
+```bash
+openssl rand -base64 32 | npx wrangler secret put ADMIN_TOKEN
+```
+
+運営者名・連絡先（ヘルプページに表示。任意）は `wrangler.jsonc` の `vars.OPERATOR_NAME` /
+`vars.OPERATOR_CONTACT` に書きます（シークレットではないので secret put は不要）。
+
+通報を確認する:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<your-domain>/api/admin/reports?limit=50"
+```
+
+`bundleId`（通報のハッシュ）を指定してリンクを無効化する:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"bundleId":"<reports 一覧の bundleId>"}' \
+  "https://<your-domain>/api/admin/takedown"
+```
+
+削除に成功すると `{"ok":true,"deleted":true}` が返り、同じ `bundleId` の未処理の通報は
+処理済みになって以降 `/api/admin/reports` には出てきません（存在しない `bundleId` の場合は
+`deleted:false`）。R2 のオブジェクトと D1 の行はこの時点で完全に削除され、復元できません。
+
+**takedown は冪等です。** R2 側の削除が一部失敗した場合（ネットワーク瞬断など）は D1 の行を
+残したまま `{"ok":false,"deleted":false,"pending":["<失敗した r2_key>", ...]}` を返します
+（500 エラーにはしません）。この場合は同じ `bundleId` でそのまま `takedown` を再実行してください。
+成功するまで D1 の行と `bundle_files` は残り続けるので、途中で R2 の孤児オブジェクトと
+D1 だけ消えた不整合な状態にはなりません。
+
+通報 API (`POST /api/files/:token/report`) にも IP あたりのレート制限を掛けたい場合、
+`wrangler.jsonc` の `ratelimits` に `REPORT_LIMITER` を追加します（既定で入っています）。
+挙動は 6 節の `UPLOAD_LIMITER` と同じです。
+
 ## 3. デプロイ
 
 ```bash
@@ -97,7 +178,40 @@ npx wrangler r2 bucket lifecycle add cryptbox-blobs \
   --name abort-multipart --abort-multipart-days 1
 ```
 
-## 6. 動作確認
+## 6. レート制限（POST /api/uploads）
+
+IP あたりのアップロード開始回数を [Workers Rate Limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+で絞っています。`wrangler.jsonc` の `ratelimits` に既定で入っており、**デプロイするだけで有効**です。
+この binding は 2025-09-19 に GA（一般提供）になっており、本番ワークロードに使える安定版です
+（出典: [Rate Limiting in Workers is now GA](https://developers.cloudflare.com/changelog/post/2025-09-19-ratelimit-workers-ga/)）。
+
+> 無料プランでの利用可否・必要な `wrangler` バージョン・`period` に指定できる値は
+> ドキュメント検索で裏取りできなかったため**未確認**です。デプロイ前に
+> [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+> の一次情報で確認してください。
+
+```jsonc
+"ratelimits": [
+  { "name": "UPLOAD_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+]
+```
+
+- `limit` / `period` を変えて調整します。デプロイし直せば反映されます。
+- binding ごと削除すれば（`ratelimits` ブロックを丸ごと消す）制限なしに戻ります
+  （`c.env.UPLOAD_LIMITER` が undefined になり、コード側は自動的にスキップします）。
+- この binding は Worker インスタンス単位の近似カウントです。より厳密・大規模な制限や、
+  `/api/uploads` 以外のパスも含めた防御が要る場合はあわせて
+  ダッシュボードの **Security → WAF → Rate limiting rules** も検討してください
+  （対象パス `/api/uploads`、しきい値・期間は上と揃える、アクションは Block や
+  Managed Challenge）。WAF のレート制限は Cloudflare のエッジで Worker を呼ぶ前に効くため、
+  より安価に大量リクエストを弾けます。
+- **この binding が絞るのはセッション作成回数（`POST /api/uploads`）だけです。**
+  チャンクの PUT（`PUT /api/uploads/:token/files/:file/parts/:chunk`）や、
+  ダウンロード側の blob GET は絞りません。転送量そのもの（帯域・データ量）を制限したい場合は
+  `MAX_FILE_SIZE`（1 バンドルの合計サイズ上限）と、上記の WAF Rate limiting rules
+  （対象パスを転送系エンドポイントまで広げる）を別途設計してください。
+
+## 7. 動作確認
 
 ```bash
 curl -I https://<your-domain>/            # HSTS と CSP が付いているか

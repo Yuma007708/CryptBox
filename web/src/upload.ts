@@ -33,6 +33,8 @@ export interface UploadOptions {
   expiresIn: number;
   maxDownloads: number | null;
   signal: AbortSignal;
+  /** Cloudflare Turnstile のトークン。サイトキーが無い（無効化されている）環境では undefined */
+  turnstileToken?: string;
   onStage(stage: string): void;
   onProgress(sentPlainBytes: number, totalPlainBytes: number): void;
 }
@@ -112,7 +114,11 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
   options.onStage('アップロードを開始しています…');
   const session = await postJson<{ uploadToken: string; files: { index: number }[] }>(
     '/api/uploads',
-    { chunkSize, files: files.map((file) => ({ plainSize: file.size })) },
+    {
+      chunkSize,
+      files: files.map((file) => ({ plainSize: file.size })),
+      turnstileToken: options.turnstileToken,
+    },
     signal,
   );
 
