@@ -2,14 +2,17 @@ import { clear, h } from '../dom.js';
 import { extensionLabel, icon } from '../icons.js';
 import { formatBytes, formatDateTime, formatDuration, relativeTime } from '../format.js';
 import { activeHistory, historyUrl, removeHistory, type HistoryEntry } from '../history.js';
-import { deleteBundle } from '../download.js';
+import { deleteBundle, fetchReceipt } from '../download.js';
 import { deriveAuthToken } from '../crypto.js';
 import { fromBase64Url } from '../../../shared/format.js';
+import type { DeletionReceipt } from '../../../shared/receipt.js';
+import { renderNotDeletedHint, renderReceiptCard } from '../receipt-ui.js';
 import { copyToClipboard, describeError, navigate } from '../ui.js';
 
 export function renderHistory(view: HTMLElement): void {
   const alert = h('div', { class: 'alert', hidden: true });
   const list = h('div', { class: 'card' });
+  const receiptPanel = h('div', { hidden: true });
 
   view.append(
     h('h1', { class: 'view-title' }, '送信履歴'),
@@ -20,6 +23,7 @@ export function renderHistory(view: HTMLElement): void {
     ),
     alert,
     list,
+    receiptPanel,
   );
 
   const showError = (message: string) => {
@@ -28,11 +32,40 @@ export function renderHistory(view: HTMLElement): void {
     alert.hidden = false;
   };
 
+  const showReceipt = (receipt: DeletionReceipt) => {
+    clear(receiptPanel);
+    receiptPanel.append(renderReceiptCard(receipt));
+    receiptPanel.hidden = false;
+  };
+
+  async function checkReceipt(entry: HistoryEntry): Promise<void> {
+    clear(receiptPanel);
+    receiptPanel.hidden = false;
+    receiptPanel.append(
+      h('div', { class: 'card' }, h('div', { class: 'empty' }, h('div', { class: 'spinner' }), h('p', {}, '確認しています…'))),
+    );
+    try {
+      const authToken = await deriveAuthToken(fromBase64Url(entry.linkSecret));
+      const result = await fetchReceipt(entry.token, authToken);
+      clear(receiptPanel);
+      if (result.deleted && result.receipt) {
+        receiptPanel.append(renderReceiptCard(result.receipt));
+      } else {
+        receiptPanel.append(renderNotDeletedHint(entry.expiresAt));
+      }
+    } catch (error) {
+      clear(receiptPanel);
+      showError(`削除証明の確認に失敗しました: ${describeError(error)}`);
+      receiptPanel.hidden = true;
+    }
+  }
+
   async function remove(entry: HistoryEntry): Promise<void> {
     if (!confirm('この共有リンクをサーバーからも削除します。よろしいですか？')) return;
     try {
       const authToken = await deriveAuthToken(fromBase64Url(entry.linkSecret));
-      await deleteBundle(entry.token, authToken);
+      const { receipt } = await deleteBundle(entry.token, authToken);
+      if (receipt) showReceipt(receipt);
     } catch (error) {
       // すでに期限切れ・削除済みなら履歴からだけ消せばよい
       showError(`サーバー側の削除に失敗しました: ${describeError(error)}`);
@@ -119,6 +152,16 @@ export function renderHistory(view: HTMLElement): void {
                 },
               },
               icon('link', 'icon-sm'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'icon-button',
+                title: '削除証明を確認',
+                on: { click: () => void checkReceipt(entry) },
+              },
+              icon('shield', 'icon-sm'),
             ),
             h(
               'button',

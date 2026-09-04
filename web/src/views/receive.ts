@@ -20,6 +20,9 @@ import { createSaver, prepareServiceWorker, type Saver } from '../saver.js';
 import { keepAwake, shareFile } from '../native.js';
 import { isNative } from '../platform.js';
 import { fromBase64Url } from '../../../shared/format.js';
+import type { DeletionReceipt } from '../../../shared/receipt.js';
+import { renderReceiptCard } from '../receipt-ui.js';
+import { ApiError } from '../api.js';
 import { createTracker, describeError } from '../ui.js';
 
 export function renderReceive(root: HTMLElement, token: string): void {
@@ -84,6 +87,9 @@ export function renderReceive(root: HTMLElement, token: string): void {
     } catch (error) {
       clear(body);
       showError(describeError(error));
+      if (error instanceof ApiError && error.receipt) {
+        body.append(renderReceiptCard(error.receipt));
+      }
       return;
     }
 
@@ -201,19 +207,20 @@ export function renderReceive(root: HTMLElement, token: string): void {
       if (pingTimer) clearInterval(pingTimer);
       try {
         const result = await finishDownload(token, grant.grant);
-        if (result.deleted) markDeleted();
+        if (result.deleted) markDeleted(result.receipt ?? null);
       } catch {
         /* 削除は Cron が猶予時間後に引き継ぐ */
       }
     };
 
-    const markDeleted = (): void => {
+    const markDeleted = (receipt: DeletionReceipt | null): void => {
       deleted = true;
       for (const button of fileButtons) button.disabled = true;
       downloadAll.disabled = true;
       remaining.textContent =
         'ダウンロード上限に達したため、このリンクのデータはサーバーから完全に削除されました。';
       summaryRemaining.textContent = '0 回';
+      if (receipt) body.append(renderReceiptCard(receipt));
     };
 
     window.addEventListener('pagehide', () => {

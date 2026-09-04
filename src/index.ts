@@ -1,6 +1,13 @@
 import { Hono } from 'hono';
 import type { Env } from './env.js';
-import { GRANT_TTL_MS, UPLOAD_TTL_MS, downloadGraceMs, maxFileSize, allowedAppOrigins } from './env.js';
+import {
+  GRANT_TTL_MS,
+  UPLOAD_TTL_MS,
+  downloadGraceMs,
+  maxFileSize,
+  allowedAppOrigins,
+  receiptRetentionMs,
+} from './env.js';
 import {
   BadRequest,
   decodeFixed,
@@ -8,8 +15,10 @@ import {
   randomBytes,
   sha256Hex,
   signGrant,
+  signReceipt,
   timingSafeEqual,
   verifyGrant,
+  verifyReceiptSignature,
 } from './lib.js';
 import {
   FILE_TOKEN_BYTES,
@@ -25,6 +34,7 @@ import {
   toBase64Url,
   totalChunks as computeChunks,
 } from '../shared/format.js';
+import { isDeletionReceiptShape, type DeletionReason, type DeletionReceipt } from '../shared/receipt.js';
 
 /** R2 マルチパートの制約 */
 const MIN_CHUNK_SIZE = 5 * 1024 * 1024;
@@ -75,13 +85,22 @@ app.onError((err, c) => {
 });
 
 class NotFound extends Error {}
-class Gone extends Error {}
+class Gone extends Error {
+  constructor(
+    message: string,
+    readonly receipt: DeletionReceipt | null,
+  ) {
+    super(message);
+  }
+}
 
 function errorResponse(err: unknown): Response | null {
   if (err instanceof NotFound) {
     return Response.json({ error: 'ファイルが見つかりません' }, { status: 404 });
   }
-  if (err instanceof Gone) return Response.json({ error: err.message }, { status: 410 });
+  if (err instanceof Gone) {
+    return Response.json({ error: err.message, receipt: err.receipt }, { status: 410 });
+  }
   return null;
 }
 
@@ -480,8 +499,8 @@ async function authorize(env: Env, token: string, authToken: unknown): Promise<B
   if (!timingSafeEqual(presented, row.auth_hash)) throw new NotFound();
   if (row.expires_at <= Date.now()) {
     // 期限切れは Cron を待たず、アクセスされた時点で R2 ごと消す
-    await deleteBundle(env, row.id);
-    throw new Gone('有効期限が切れています');
+    const receipt = await deleteBundle(env, row.id, 'expired');
+    throw new Gone('有効期限が切れています', receipt);
   }
   return row;
 }
@@ -636,10 +655,80 @@ app.post('/api/files/:token/finish', async (c) => {
 
   const exhausted = row.max_downloads !== null && row.download_count >= row.max_downloads;
   if (exhausted && row.active_downloads <= 0) {
-    await deleteBundle(c.env, bundleId);
-    return c.json({ ok: true, deleted: true });
+    const receipt = await deleteBundle(c.env, bundleId, 'limit_reached');
+    return c.json({ ok: true, deleted: true, receipt });
   }
   return c.json({ ok: true, deleted: false });
+});
+
+/**
+ * バンドルの削除レシートを取得する。
+ * 共有 URL のパス部分（トークン）はログや Referer に残り得るため、他のエンドポイントと
+ * 同様に authToken（フラグメントの鍵からしか作れない）も必須にする。
+ */
+app.post('/api/files/:token/receipt', async (c) => {
+  const body = await readJson(c.req.raw);
+  const notFound = () => c.json({ error: 'ファイルが見つかりません' }, 404);
+
+  if (typeof body.authToken !== 'string') return notFound();
+  let presented: string;
+  try {
+    presented = await sha256Hex(fromBase64Url(body.authToken));
+  } catch {
+    return notFound();
+  }
+
+  const bundleId = await sha256Hex(c.req.param('token'));
+
+  const receiptRow = await c.env.DB.prepare(
+    `SELECT bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature, auth_hash
+       FROM deletion_receipts WHERE bundle_id = ?`,
+  )
+    .bind(bundleId)
+    .first<{
+      bundle_id: string;
+      created_at: number;
+      deleted_at: number;
+      reason: DeletionReason;
+      file_count: number;
+      total_plain_size: number;
+      signature: string;
+      auth_hash: string;
+    }>();
+
+  if (receiptRow) {
+    if (!timingSafeEqual(presented, receiptRow.auth_hash)) return notFound();
+    const receipt: DeletionReceipt = {
+      version: 1,
+      bundleId: receiptRow.bundle_id,
+      createdAt: receiptRow.created_at,
+      deletedAt: receiptRow.deleted_at,
+      reason: receiptRow.reason,
+      fileCount: receiptRow.file_count,
+      totalPlainSize: receiptRow.total_plain_size,
+      signature: receiptRow.signature,
+    };
+    return c.json({ deleted: true, receipt });
+  }
+
+  const bundle = await c.env.DB.prepare(`SELECT id, auth_hash FROM bundles WHERE id = ?`)
+    .bind(bundleId)
+    .first<{ id: string; auth_hash: string }>();
+  if (bundle) {
+    if (!timingSafeEqual(presented, bundle.auth_hash)) return notFound();
+    return c.json({ deleted: false });
+  }
+
+  return notFound();
+});
+
+/** 削除レシートの署名検証。DB は見ず、署名を再計算するだけ */
+app.post('/api/receipts/verify', async (c) => {
+  const body = await readJson(c.req.raw);
+  const candidate = body.receipt;
+  if (!isDeletionReceiptShape(candidate)) return c.json({ valid: false });
+  const valid = await verifyReceiptSignature(c.env.GRANT_SECRET, candidate);
+  return c.json({ valid });
 });
 
 app.get('/api/files/:token/files/:file/blob', async (c) => {
@@ -700,21 +789,77 @@ app.delete('/api/files/:token', async (c) => {
     if (res) return res;
     throw err;
   }
-  await deleteBundle(c.env, bundle.id);
-  return c.json({ ok: true });
+  const receipt = await deleteBundle(c.env, bundle.id, 'sender_deleted');
+  return c.json({ ok: true, receipt });
 });
 
-async function deleteBundle(env: Env, bundleId: string): Promise<void> {
+/**
+ * バンドルを R2 + D1 から完全削除し、同じ DB.batch 内で削除レシートを記録する。
+ * bundles 行が既に存在しない（二重削除）場合はレシートを作らず null を返す。
+ */
+async function deleteBundle(
+  env: Env,
+  bundleId: string,
+  reason: DeletionReason,
+): Promise<DeletionReceipt | null> {
+  const bundle = await env.DB.prepare(
+    `SELECT created_at, file_count, total_plain_size, auth_hash FROM bundles WHERE id = ?`,
+  )
+    .bind(bundleId)
+    .first<{ created_at: number; file_count: number; total_plain_size: number; auth_hash: string }>();
+
   const files = await env.DB.prepare(`SELECT r2_key FROM bundle_files WHERE bundle_id = ?`)
     .bind(bundleId)
     .all<{ r2_key: string }>();
   for (const file of files.results) {
     await env.BUCKET.delete(file.r2_key);
   }
-  await env.DB.batch([
+
+  const statements = [
     env.DB.prepare(`DELETE FROM bundle_files WHERE bundle_id = ?`).bind(bundleId),
     env.DB.prepare(`DELETE FROM bundles WHERE id = ?`).bind(bundleId),
-  ]);
+  ];
+
+  let receipt: DeletionReceipt | null = null;
+  if (bundle) {
+    const unsigned = {
+      version: 1 as const,
+      bundleId,
+      createdAt: bundle.created_at,
+      deletedAt: Date.now(),
+      reason,
+      fileCount: bundle.file_count,
+      totalPlainSize: bundle.total_plain_size,
+    };
+    const signature = await signReceipt(env.GRANT_SECRET, unsigned);
+    receipt = { ...unsigned, signature };
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO deletion_receipts
+           (bundle_id, created_at, deleted_at, reason, file_count, total_plain_size, signature, auth_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (bundle_id) DO UPDATE SET
+           deleted_at = excluded.deleted_at,
+           reason = excluded.reason,
+           file_count = excluded.file_count,
+           total_plain_size = excluded.total_plain_size,
+           signature = excluded.signature,
+           auth_hash = excluded.auth_hash`,
+      ).bind(
+        bundleId,
+        unsigned.createdAt,
+        unsigned.deletedAt,
+        reason,
+        unsigned.fileCount,
+        unsigned.totalPlainSize,
+        signature,
+        bundle.auth_hash,
+      ),
+    );
+  }
+
+  await env.DB.batch(statements);
+  return receipt;
 }
 
 function parseRange(
@@ -757,13 +902,15 @@ app.get('*', (c) => c.env.ASSETS.fetch(c.req.raw));
 export async function purge(
   env: Env,
   now = Date.now(),
-): Promise<{ bundles: number; uploads: number }> {
+): Promise<{ bundles: number; uploads: number; receipts: number }> {
   const grace = downloadGraceMs(env);
   // 期限切れ、またはダウンロード上限に達したもの。
   // 上限到達後は finish 通知（アクティブ 0）で即座に、
   // 通知が来ない場合も ping の途絶から猶予時間で削除する。
+  // reason は「期限切れ」を優先する（両方の条件を満たす場合もあり得るため）
   const expired = await env.DB.prepare(
-    `SELECT id FROM bundles
+    `SELECT id, CASE WHEN expires_at <= ? THEN 'expired' ELSE 'limit_reached' END AS reason
+       FROM bundles
       WHERE expires_at <= ?
          OR (max_downloads IS NOT NULL
              AND download_count >= max_downloads
@@ -772,11 +919,11 @@ export async function purge(
                   OR last_activity_at + ? <= ?))
       LIMIT 200`,
   )
-    .bind(now, grace, now)
-    .all<{ id: string }>();
+    .bind(now, now, grace, now)
+    .all<{ id: string; reason: DeletionReason }>();
 
   for (const row of expired.results) {
-    await deleteBundle(env, row.id);
+    await deleteBundle(env, row.id, row.reason);
   }
 
   // 放棄されたアップロードセッション
@@ -802,7 +949,23 @@ export async function purge(
     ]);
   }
 
-  return { bundles: expired.results.length, uploads: stale.results.length };
+  // 保持期間を過ぎた削除レシートを消す。バンドル側 (LIMIT 200) に揃えて
+  // 1 回の cron で処理する件数を刻む。500 件を超える分は次回 cron に持ち越される
+  const receiptCutoff = now - receiptRetentionMs(env);
+  const purgedReceipts = await env.DB.prepare(
+    `DELETE FROM deletion_receipts
+      WHERE bundle_id IN (
+        SELECT bundle_id FROM deletion_receipts WHERE deleted_at <= ? LIMIT 500
+      )`,
+  )
+    .bind(receiptCutoff)
+    .run();
+
+  return {
+    bundles: expired.results.length,
+    uploads: stale.results.length,
+    receipts: purgedReceipts.meta.changes ?? 0,
+  };
 }
 
 export default {
@@ -810,7 +973,9 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
       purge(env).then((result) => {
-        console.log(`purged bundles=${result.bundles} uploads=${result.uploads}`);
+        console.log(
+          `purged bundles=${result.bundles} uploads=${result.uploads} receipts=${result.receipts}`,
+        );
       }),
     );
   },

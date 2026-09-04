@@ -14,6 +14,7 @@ import {
   fromBase64Url,
   toBase64Url,
 } from '../../shared/format.js';
+import type { DeletionReceipt } from '../../shared/receipt.js';
 
 export interface RemoteFile {
   index: number;
@@ -53,10 +54,29 @@ export async function fetchInfo(token: string, authToken: Uint8Array): Promise<B
   });
 }
 
-export async function deleteBundle(token: string, authToken: Uint8Array): Promise<void> {
-  await deleteJson(`/api/files/${encodeURIComponent(token)}`, {
+export async function deleteBundle(
+  token: string,
+  authToken: Uint8Array,
+): Promise<{ receipt: DeletionReceipt | null }> {
+  return deleteJson(`/api/files/${encodeURIComponent(token)}`, {
     authToken: toBase64Url(authToken),
   });
+}
+
+/** 削除レシートを取得する。他の API 同様、authToken（linkSecret 由来）による認可が要る */
+export async function fetchReceipt(
+  token: string,
+  authToken: Uint8Array,
+): Promise<{ deleted: boolean; receipt?: DeletionReceipt }> {
+  return postJson(`/api/files/${encodeURIComponent(token)}/receipt`, {
+    authToken: toBase64Url(authToken),
+  });
+}
+
+/** DB を見ず署名だけを再検証する */
+export async function verifyReceipt(receipt: DeletionReceipt): Promise<boolean> {
+  const result = await postJson<{ valid: boolean }>('/api/receipts/verify', { receipt });
+  return result.valid;
 }
 
 export interface OpenedFile {
@@ -140,10 +160,11 @@ export async function pingDownload(token: string, grant: string): Promise<void> 
  * ダウンロード完了（またはページ離脱）を通知する。
  * 回数上限に達していれば、サーバーはこの時点でバンドルを完全削除する。
  */
-export async function finishDownload(token: string, grant: string): Promise<{ deleted: boolean }> {
-  return postJson<{ deleted: boolean }>(`/api/files/${encodeURIComponent(token)}/finish`, {
-    grant,
-  });
+export async function finishDownload(
+  token: string,
+  grant: string,
+): Promise<{ deleted: boolean; receipt?: DeletionReceipt }> {
+  return postJson(`/api/files/${encodeURIComponent(token)}/finish`, { grant });
 }
 
 /** ページ離脱時用。レスポンスを待たずに finish を送る */

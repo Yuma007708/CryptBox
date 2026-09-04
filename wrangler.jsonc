@@ -38,5 +38,7 @@
 
   "vars": {
     "MAX_FILE_SIZE": "107374182400"
+    // 削除レシートの保持期間（日）。未設定なら 90 日
+    // "RECEIPT_RETENTION_DAYS": "90"
   }
 }

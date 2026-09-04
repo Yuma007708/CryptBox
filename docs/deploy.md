@@ -40,6 +40,14 @@ npx wrangler secret put UPLOAD_TOKEN
 npm run deploy      # フロントエンドをビルドして wrangler deploy
 ```
 
+**コード反映前にスキーマ適用が必要です。** `npm run deploy` は
+`build:web` → `db:init`（`src/schema.sql` を本番 D1 に適用）→ `wrangler deploy` の順で
+自動的に行うので、通常は個別に `db:init` を叩く必要はありません。`schema.sql` は
+`CREATE TABLE IF NOT EXISTS` のみで構成されているため、既存データに対して安全に
+繰り返し適用できます（削除レシートの INSERT はバンドル削除と同じ `DB.batch` に
+入っているため、`deletion_receipts` テーブルが無いまま新しいコードだけをデプロイすると
+削除処理自体が失敗します）。
+
 ## 4. TLS 1.3 のみに固定する
 
 Cloudflare ダッシュボード → 対象ゾーン → **SSL/TLS**:

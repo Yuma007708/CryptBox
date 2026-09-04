@@ -15,6 +15,9 @@ export interface Env {
   /** 回数上限到達後、ping 途絶から削除までの猶予（分）。既定 15 分 */
   DOWNLOAD_GRACE_MINUTES?: string;
 
+  /** 削除レシートの保持期間（日）。既定 90 日 */
+  RECEIPT_RETENTION_DAYS?: string;
+
   /**
    * CORS を許可するオリジン（カンマ区切り）。
    * Capacitor アプリは capacitor://localhost (iOS) / https://localhost (Android) から
@@ -45,6 +48,15 @@ export function maxFileSize(env: Env): number {
 export function downloadGraceMs(env: Env): number {
   const minutes = Number(env.DOWNLOAD_GRACE_MINUTES);
   return Number.isFinite(minutes) && minutes > 0 ? minutes * 60 * 1000 : DEFAULT_DOWNLOAD_GRACE_MS;
+}
+
+/** 削除レシートの既定保持期間（日） */
+export const DEFAULT_RECEIPT_RETENTION_DAYS = 90;
+
+export function receiptRetentionMs(env: Env): number {
+  const days = Number(env.RECEIPT_RETENTION_DAYS);
+  const effective = Number.isFinite(days) && days > 0 ? days : DEFAULT_RECEIPT_RETENTION_DAYS;
+  return effective * 24 * 60 * 60 * 1000;
 }
 
 const DEFAULT_APP_ORIGINS = ['capacitor://localhost', 'https://localhost', 'http://localhost'];

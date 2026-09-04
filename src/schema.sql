@@ -76,3 +76,21 @@ CREATE TABLE IF NOT EXISTS upload_parts (
   etag        TEXT NOT NULL,
   PRIMARY KEY (upload_id, file_index, part_number)
 );
+
+-- 削除レシート: バンドルが消えたとき「いつ・なぜ」を署名付きで記録する。
+-- ファイル名・鍵・IP は含まない。保持期間 (RECEIPT_RETENTION_DAYS) を過ぎたら Cron が消す
+-- auth_hash はバンドル行からコピーする。/receipt がトークンだけの第三者に
+-- レシート（削除時刻・理由・ファイル数・平文合計サイズ）を渡してしまわないよう、
+-- authToken 保有者だけに絞るための検証値
+CREATE TABLE IF NOT EXISTS deletion_receipts (
+  bundle_id         TEXT PRIMARY KEY,
+  created_at        INTEGER NOT NULL,
+  deleted_at        INTEGER NOT NULL,
+  reason            TEXT NOT NULL,          -- 'expired' | 'limit_reached' | 'sender_deleted'
+  file_count        INTEGER NOT NULL,
+  total_plain_size  INTEGER NOT NULL,
+  signature         TEXT NOT NULL,          -- base64url(HMAC-SHA256)
+  auth_hash         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deletion_receipts_deleted_at ON deletion_receipts (deleted_at);
