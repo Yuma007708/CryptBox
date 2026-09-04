@@ -39,11 +39,52 @@ export default defineConfig({
                 GRANT_SECRET: 'test-grant-secret',
                 MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
                 TURNSTILE_SECRET: 'test-turnstile-secret',
+                TURNSTILE_SITE_KEY: 'test-site-key',
               },
             },
           }),
         ],
         test: { name: 'turnstile', include: ['test/abuse/turnstile.test.ts'] },
+      },
+      {
+        // hostname 照合 (TURNSTILE_HOSTNAMES) のみを対象にした結合テスト
+        plugins: [
+          cloudflareTest({
+            main: './src/index.ts',
+            miniflare: {
+              compatibilityDate: '2026-08-01',
+              d1Databases: ['DB'],
+              r2Buckets: ['BUCKET'],
+              bindings: {
+                GRANT_SECRET: 'test-grant-secret',
+                MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
+                TURNSTILE_SECRET: 'test-turnstile-secret',
+                TURNSTILE_SITE_KEY: 'test-site-key',
+                TURNSTILE_HOSTNAMES: 'cryptbox.test,example.com',
+              },
+            },
+          }),
+        ],
+        test: { name: 'turnstile-hostname', include: ['test/abuse/turnstile-hostname.test.ts'] },
+      },
+      {
+        // TURNSTILE_SECRET はあるが TURNSTILE_SITE_KEY が無い「片肺デプロイ」を再現する結合テスト
+        plugins: [
+          cloudflareTest({
+            main: './src/index.ts',
+            miniflare: {
+              compatibilityDate: '2026-08-01',
+              d1Databases: ['DB'],
+              r2Buckets: ['BUCKET'],
+              bindings: {
+                GRANT_SECRET: 'test-grant-secret',
+                MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
+                TURNSTILE_SECRET: 'test-turnstile-secret',
+              },
+            },
+          }),
+        ],
+        test: { name: 'turnstile-failclosed', include: ['test/abuse/turnstile-failclosed.test.ts'] },
       },
       {
         // レート制限のみを対象にした結合テスト（UPLOAD_LIMITER を小さい上限で設定）
@@ -70,6 +111,10 @@ export default defineConfig({
         // workerd は実行時の WebAssembly.compile を禁じているため、
         // Argon2id (WASM) を含むテストは Node 環境で回す
         test: { name: 'node', environment: 'node', include: ['test/node/*.test.ts'] },
+      },
+      {
+        // フロントエンド（web/src）用。DOM API が要るため happy-dom で回す
+        test: { name: 'web', environment: 'happy-dom', include: ['test/web/*.test.ts'] },
       },
     ],
   },

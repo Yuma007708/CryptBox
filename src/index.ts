@@ -9,6 +9,7 @@ import {
   allowedAppOrigins,
   receiptRetentionMs,
   turnstileSiteKey,
+  turnstileHostnames,
 } from './env.js';
 import {
   BadRequest,
@@ -114,9 +115,22 @@ function assertUploadAllowed(c: { req: { header: (name: string) => string | unde
   if (!timingSafeEqual(presented, expected)) throw new BadRequest('アップロードが許可されていません');
 }
 
+/** siteverify のレスポンス形。ドキュメントに無いフィールドを送ってくることもあるので緩めに扱う */
+interface SiteverifyResponse {
+  success?: boolean;
+  hostname?: string;
+  action?: string;
+  'error-codes'?: string[];
+}
+
+/** siteverify に送るトークンの長さ上限。Turnstile のトークンはこれより大幅に短い */
+const MAX_TOKEN_LENGTH = 2048;
+
 /**
  * Cloudflare Turnstile のトークンを検証する。
- * `TURNSTILE_SECRET` が未設定なら検証をスキップする（開発・セルフホストの既定）。
+ * `TURNSTILE_SECRET` が未設定、または `TURNSTILE_SITE_KEY` が未設定（クライアントに
+ * サイトキーを配っていない = そもそもトークンを送れない片肺状態）なら検証をスキップする
+ * （開発・セルフホストの既定）。
  * ネットワークエラー・応答不正はすべて失敗（false）として扱う（fail-closed）。
  */
 async function verifyTurnstile(
@@ -126,7 +140,9 @@ async function verifyTurnstile(
 ): Promise<boolean> {
   const secret = env.TURNSTILE_SECRET;
   if (!secret) return true;
+  if (!turnstileSiteKey(env)) return true;
   if (typeof token !== 'string' || token.length === 0) return false;
+  if (token.length > MAX_TOKEN_LENGTH) return false;
 
   const form = new URLSearchParams({ secret, response: token });
   if (remoteIp) form.set('remoteip', remoteIp);
@@ -136,10 +152,24 @@ async function verifyTurnstile(
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form,
+      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return false;
-    const result = (await res.json()) as { success?: boolean };
-    return result.success === true;
+    const result = (await res.json()) as SiteverifyResponse;
+    if (result.success !== true) {
+      if (result['error-codes']?.length) {
+        console.warn('Turnstile siteverify failed', result['error-codes']);
+      }
+      return false;
+    }
+
+    const allowedHostnames = turnstileHostnames(env);
+    if (allowedHostnames && !(result.hostname !== undefined && allowedHostnames.has(result.hostname))) {
+      console.warn('Turnstile siteverify hostname mismatch', result.hostname);
+      return false;
+    }
+
+    return true;
   } catch {
     return false;
   }
@@ -151,9 +181,34 @@ async function verifyTurnstile(
  */
 async function checkUploadRateLimit(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
   if (!c.env.UPLOAD_LIMITER) return true;
-  const ip = c.req.header('cf-connecting-ip') ?? 'unknown';
-  const { success } = await c.env.UPLOAD_LIMITER.limit({ key: ip });
+  const key = rateLimitKey(c.req.header('cf-connecting-ip'));
+  const { success } = await c.env.UPLOAD_LIMITER.limit({ key });
   return success;
+}
+
+/**
+ * レート制限のキーに使う IP の正規化。
+ * IPv6 はホスト部が可変（同一利用者でも接続のたびに変わりうる）ため /64 プレフィックスに丸める。
+ * IPv4 やパース不能な値はそのまま使う。
+ */
+export function rateLimitKey(ip: string | undefined): string {
+  // 本番では Cloudflare が cf-connecting-ip を必ず付与するため、ここに来ることはない。
+  // 到達した場合は前段の構成（プロキシ・ローカル実行）に異常があるということ。
+  if (!ip) return 'unknown';
+  if (!ip.includes(':')) return ip;
+
+  const hextets = ip.split(':');
+  // "::" 短縮を含む IPv6 を /64 (先頭 4 hextet) に丸める。
+  // 短縮が無ければ先頭 4 個、あれば "::" より前の hextet を優先する。
+  const doubleColonIndex = ip.indexOf('::');
+  let prefixHextets: string[];
+  if (doubleColonIndex !== -1) {
+    const before = ip.slice(0, doubleColonIndex).split(':').filter(Boolean);
+    prefixHextets = [...before, ...Array(4).fill('0')].slice(0, 4);
+  } else {
+    prefixHextets = hextets.slice(0, 4);
+  }
+  return `${prefixHextets.join(':')}::/64`;
 }
 
 function requireInt(value: unknown, field: string): number {
@@ -208,7 +263,11 @@ app.post('/api/uploads', async (c) => {
   assertUploadAllowed(c);
 
   if (!(await checkUploadRateLimit(c))) {
-    return c.json({ error: 'アップロードが多すぎます。しばらくしてから再度お試しください' }, 429);
+    return c.json(
+      { error: 'アップロードが多すぎます。しばらくしてから再度お試しください' },
+      429,
+      { 'Retry-After': '60' },
+    );
   }
 
   const body = await readJson(c.req.raw);

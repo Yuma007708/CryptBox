@@ -9,6 +9,8 @@ interface TurnstileRenderOptions {
   appearance: 'always' | 'execute' | 'interaction-only';
   callback: (token: string) => void;
   'error-callback': () => void;
+  'expired-callback': () => void;
+  'timeout-callback': () => void;
 }
 
 interface TurnstileApi {
@@ -51,35 +53,88 @@ export interface TurnstileWidget {
   getToken(): Promise<string>;
 }
 
+/** getToken() が待つ上限（ミリ秒）。Turnstile の自動リフレッシュ・初回発行を待つのに十分な余裕を持たせる */
+const TOKEN_WAIT_TIMEOUT_MS = 15_000;
+
+interface Waiter {
+  resolve: (token: string) => void;
+  reject: (error: Error) => void;
+}
+
 export async function createTurnstileWidget(
   container: HTMLElement,
   siteKey: string,
 ): Promise<TurnstileWidget> {
   const turnstile = await loadScript();
 
-  let resolveToken: ((token: string) => void) | null = null;
-  let rejectToken: ((error: Error) => void) | null = null;
-  let tokenPromise = new Promise<string>((resolve, reject) => {
-    resolveToken = resolve;
-    rejectToken = reject;
-  });
+  // Turnstile は `interaction-only` でも約 300 秒ごとにトークンを自動リフレッシュし、
+  // そのたびに callback を呼び直す。1 回しか resolve しない Promise で保持すると
+  // 最初のトークンしか使えず、5 分後の送信が必ず失敗する。
+  // そのため「最新のトークン」と「待っている呼び出し」を分けて管理する。
+  let latest: string | null = null;
+  let waiters: Waiter[] = [];
+
+  const settleWaiters = (settle: (waiter: Waiter) => void) => {
+    const pending = waiters;
+    waiters = [];
+    for (const waiter of pending) settle(waiter);
+  };
 
   const widgetId = turnstile.render(container, {
     sitekey: siteKey,
     appearance: 'interaction-only',
-    callback: (token) => resolveToken?.(token),
-    'error-callback': () => rejectToken?.(new Error('Turnstile の検証に失敗しました')),
+    callback: (token) => {
+      latest = token;
+      settleWaiters((waiter) => waiter.resolve(token));
+    },
+    'error-callback': () => {
+      settleWaiters((waiter) => waiter.reject(new Error('Turnstile の検証に失敗しました')));
+    },
+    'expired-callback': () => {
+      latest = null;
+      turnstile.reset(widgetId);
+    },
+    'timeout-callback': () => {
+      latest = null;
+      turnstile.reset(widgetId);
+    },
   });
+
+  function waitForToken(): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const waiter: Waiter = {
+        resolve: (token) => {
+          clearTimeout(timer);
+          resolve(token);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+      const timer = setTimeout(() => {
+        waiters = waiters.filter((entry) => entry !== waiter);
+        reject(
+          new Error('認証の準備がタイムアウトしました。しばらくしてから再度お試しください'),
+        );
+      }, TOKEN_WAIT_TIMEOUT_MS);
+      waiters.push(waiter);
+    });
+  }
 
   return {
     async getToken(): Promise<string> {
-      const token = await tokenPromise;
-      tokenPromise = new Promise<string>((resolve, reject) => {
-        resolveToken = resolve;
-        rejectToken = reject;
-      });
-      turnstile.reset(widgetId);
-      return token;
+      try {
+        if (latest !== null) {
+          const token = latest;
+          latest = null;
+          return token;
+        }
+        return await waitForToken();
+      } finally {
+        // 成功・失敗どちらでもリセットし、次回に備えて待ち合わせを作り直す
+        turnstile.reset(widgetId);
+      }
     },
   };
 }

@@ -184,17 +184,44 @@ export function renderSend(view: HTMLElement): void {
   /* ---------------- Turnstile（見えないウィジェット） ---------------- */
 
   const turnstileContainer = h('div', { class: 'turnstile-container' });
-  right.append(turnstileContainer);
+  const turnstileErrorBox = h('div', { class: 'alert', hidden: true });
+  right.append(turnstileContainer, turnstileErrorBox);
   let turnstileWidget: TurnstileWidget | null = null;
-  void getServerConfig().then((config) => {
-    if (!config.turnstileSiteKey) return;
-    createTurnstileWidget(turnstileContainer, config.turnstileSiteKey)
+
+  function initTurnstile(siteKey: string): void {
+    turnstileErrorBox.hidden = true;
+    clear(turnstileContainer);
+    createTurnstileWidget(turnstileContainer, siteKey)
       .then((widget) => {
         turnstileWidget = widget;
       })
       .catch((error) => {
         console.error('Turnstile の初期化に失敗しました', error);
+        clear(turnstileErrorBox);
+        turnstileErrorBox.append(
+          icon('shield', 'icon-sm'),
+          h(
+            'span',
+            {},
+            '認証の読み込みに失敗しました。広告ブロッカーを無効にするか、時間をおいて再度お試しください',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'ghost',
+              on: { click: () => initTurnstile(siteKey) },
+            },
+            '再試行',
+          ),
+        );
+        turnstileErrorBox.hidden = false;
       });
+  }
+
+  void getServerConfig().then((config) => {
+    if (!config.turnstileSiteKey) return;
+    initTurnstile(config.turnstileSiteKey);
   });
 
   /* ---------------- 左カラム ---------------- */

@@ -42,16 +42,30 @@ describe('レート制限 (UPLOAD_LIMITER, 上限 3 回/分)', () => {
       expect((await post(ipA)).status).toBe(200);
     }
     expect((await post(ipA)).status).toBe(429);
-    // 別 IP はまだ上限に達していないので通る
-    expect((await post(ipB)).status).toBe(200);
+    // 別 IP はまだ上限に達していないので通る（ipB 側も上限まで独立して叩けることを確認する）
+    for (let i = 0; i < 3; i++) {
+      expect((await post(ipB)).status).toBe(200);
+    }
+    expect((await post(ipB)).status).toBe(429);
   });
 
-  it('binding が無い環境（このテストでは想定しない）以外は 429 のとき JSON エラーを返す', async () => {
+  it('429 のときは JSON でエラーメッセージを返す', async () => {
     const ip = '198.51.100.4';
     for (let i = 0; i < 3; i++) await post(ip);
     const response = await post(ip);
     expect(response.status).toBe(429);
+    expect(response.headers.get('Retry-After')).toBe('60');
     const body = (await response.json()) as { error?: string };
     expect(body.error).toBeTruthy();
+  });
+
+  it('同じ /64 内の異なる IPv6 アドレスは同じバケットを共有する', async () => {
+    const ipv6A = '2001:db8:1234:5678:aaaa:bbbb:cccc:0001';
+    const ipv6B = '2001:db8:1234:5678:1111:2222:3333:4444';
+    for (let i = 0; i < 3; i++) {
+      expect((await post(ipv6A)).status).toBe(200);
+    }
+    // 同じ /64 の別アドレスなので、既にバケットを使い切っている
+    expect((await post(ipv6B)).status).toBe(429);
   });
 });

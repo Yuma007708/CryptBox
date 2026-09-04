@@ -40,20 +40,37 @@ npx wrangler secret put UPLOAD_TOKEN
 で保護します。**`TURNSTILE_SECRET` を設定しない限り検証はスキップされる**ため、
 セルフホストでは何もしなくても動きます。
 
+**手順の順序が重要です**（サイトキーを先に、シークレットを後に）。逆順にすると、
+シークレットが有効になった瞬間からサーバーがトークンを要求するのに、
+クライアントはまだサイトキーを持たずウィジェットを出せない「片肺」の時間帯ができ、
+その間は誰も送信できません。
+
 1. Cloudflare ダッシュボード → **Turnstile** → ウィジェットを追加。
    - ドメイン: 公開ホスト名（例: `cryptbox.example.com`）
    - ウィジェットモード: 任意（アプリ側は `appearance: 'interaction-only'` で明示的にレンダリングするため、
      Managed / Invisible のどちらでも動く）
-2. 発行された **サイトキー**（公開値）を `wrangler.jsonc` の `vars.TURNSTILE_SITE_KEY` に書き、デプロイする。
-3. **シークレット**を Worker に設定する:
+2. 発行された **サイトキー**（公開値）を `wrangler.jsonc` の `vars.TURNSTILE_SITE_KEY` に書き、
+   **`wrangler deploy` を完了させる**（`npm run deploy` でも可）。
+3. デプロイが終わってから **シークレット**を Worker に設定する:
 
 ```bash
 npx wrangler secret put TURNSTILE_SECRET
 ```
 
 以降、`GET /api/config` が `turnstileSiteKey` を返すようになり、フロントエンドが自動で
-ウィジェットを読み込みます。`TURNSTILE_SECRET` を設定した瞬間からサーバー側の検証が有効になるため、
-サイトキーとシークレットは同じタイミングで揃えてください（片方だけだと送信できなくなります）。
+ウィジェットを読み込みます。`TURNSTILE_SECRET` を設定した瞬間からサーバー側の検証が有効になります。
+
+> **安全弁**: サーバー側は `TURNSTILE_SECRET` が設定されていても `TURNSTILE_SITE_KEY` が
+> 未設定なら検証をスキップします（サイトキーを配っていなければクライアントはそもそも
+> トークンを送れないため）。上記の順序を守れなくても送信不能にはなりませんが、
+> 検証は無効なままなので早めにサイトキーを設定してください。
+
+> **fail-closed のトレードオフ**: Turnstile 検証は fail-closed（`challenges.cloudflare.com`
+> への通信が失敗・タイムアウトした場合も 403 を返す）です。Turnstile 自体が障害を起こすと
+> アップロードが全面的に止まります。緊急でアップロードを復旧させたい場合は
+> `npx wrangler secret delete TURNSTILE_SECRET` で検証をスキップに戻せます
+> （サイトキーが残っていてもクライアント側は動くので、フロントエンドの再デプロイは不要です）。
+> 失敗の原因は Worker のログに出る `error-codes`（`console.warn`）で確認できます。
 
 ## 3. デプロイ
 
@@ -121,8 +138,14 @@ npx wrangler r2 bucket lifecycle add cryptbox-blobs \
 ## 6. レート制限（POST /api/uploads）
 
 IP あたりのアップロード開始回数を [Workers Rate Limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
-で絞っています。`wrangler.jsonc` の `ratelimits` に既定で入っており、**デプロイするだけで有効**です
-（無料プランでも使えます。`wrangler` 4.36 以降が必要）。
+で絞っています。`wrangler.jsonc` の `ratelimits` に既定で入っており、**デプロイするだけで有効**です。
+この binding は 2025-09-19 に GA（一般提供）になっており、本番ワークロードに使える安定版です
+（出典: [Rate Limiting in Workers is now GA](https://developers.cloudflare.com/changelog/post/2025-09-19-ratelimit-workers-ga/)）。
+
+> 無料プランでの利用可否・必要な `wrangler` バージョン・`period` に指定できる値は
+> ドキュメント検索で裏取りできなかったため**未確認**です。デプロイ前に
+> [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+> の一次情報で確認してください。
 
 ```jsonc
 "ratelimits": [
@@ -130,7 +153,7 @@ IP あたりのアップロード開始回数を [Workers Rate Limiting binding]
 ]
 ```
 
-- `limit` / `period`（秒。10 か 60 のみ）を変えて調整します。デプロイし直せば反映されます。
+- `limit` / `period` を変えて調整します。デプロイし直せば反映されます。
 - binding ごと削除すれば（`ratelimits` ブロックを丸ごと消す）制限なしに戻ります
   （`c.env.UPLOAD_LIMITER` が undefined になり、コード側は自動的にスキップします）。
 - この binding は Worker インスタンス単位の近似カウントです。より厳密・大規模な制限や、
@@ -139,6 +162,11 @@ IP あたりのアップロード開始回数を [Workers Rate Limiting binding]
   （対象パス `/api/uploads`、しきい値・期間は上と揃える、アクションは Block や
   Managed Challenge）。WAF のレート制限は Cloudflare のエッジで Worker を呼ぶ前に効くため、
   より安価に大量リクエストを弾けます。
+- **この binding が絞るのはセッション作成回数（`POST /api/uploads`）だけです。**
+  チャンクの PUT（`PUT /api/uploads/:token/files/:file/parts/:chunk`）や、
+  ダウンロード側の blob GET は絞りません。転送量そのもの（帯域・データ量）を制限したい場合は
+  `MAX_FILE_SIZE`（1 バンドルの合計サイズ上限）と、上記の WAF Rate limiting rules
+  （対象パスを転送系エンドポイントまで広げる）を別途設計してください。
 
 ## 7. 動作確認
 

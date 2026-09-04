@@ -86,4 +86,32 @@ describe('Turnstile 検証 (TURNSTILE_SECRET 設定時)', () => {
     expect(response.status).toBe(403);
     expect(spy).not.toHaveBeenCalled();
   });
+
+  it('トークンが 2048 文字を超えていれば siteverify を呼ばずに 403', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch');
+    const response = await post(uploadBody({ turnstileToken: 'a'.repeat(2049) }));
+    expect(response.status).toBe(403);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('siteverify が 5xx (res.ok = false) を返せば 403', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response('internal error', { status: 500 }),
+    );
+    const response = await post(uploadBody({ turnstileToken: 'good-token' }));
+    expect(response.status).toBe(403);
+  });
+
+  it('siteverify が失敗し error-codes を含む場合は console.warn に出す', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      Response.json({ success: false, 'error-codes': ['invalid-input-response'] }),
+    );
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const response = await post(uploadBody({ turnstileToken: 'bad-token' }));
+    expect(response.status).toBe(403);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Turnstile'),
+      expect.arrayContaining(['invalid-input-response']),
+    );
+  });
 });

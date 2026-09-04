@@ -38,6 +38,12 @@ export interface Env {
   TURNSTILE_SECRET?: string;
 
   /**
+   * siteverify レスポンスの `hostname` と照合する許可ホスト名（カンマ区切り）。
+   * 未設定なら hostname 検証をスキップする。
+   */
+  TURNSTILE_HOSTNAMES?: string;
+
+  /**
    * IP あたりのアップロード回数を絞るレート制限 binding（Workers Rate Limiting）。
    * 未設定（ローカル・セルフホストで binding を組んでいない場合）なら制限しない。
    */
@@ -100,4 +106,13 @@ export function allowedAppOrigins(env: Env): Set<string> {
 /** クライアントに公開する Turnstile サイトキー。未設定なら Turnstile は無効 */
 export function turnstileSiteKey(env: Env): string | null {
   return env.TURNSTILE_SITE_KEY?.trim() || null;
+}
+
+/** siteverify の hostname 照合に使う許可ホスト名の集合。未設定なら null（照合スキップ） */
+export function turnstileHostnames(env: Env): Set<string> | null {
+  const raw = (env.TURNSTILE_HOSTNAMES ?? '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean);
+  return raw.length > 0 ? new Set(raw) : null;
 }
