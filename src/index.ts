@@ -5,6 +5,7 @@ import {
   UPLOAD_TTL_MS,
   downloadGraceMs,
   maxFileSize,
+  maxExpiryHours,
   allowedAppOrigins,
   receiptRetentionMs,
 } from './env.js';
@@ -24,7 +25,6 @@ import {
   FILE_TOKEN_BYTES,
   GCM_TAG_BYTES,
   KDF_SALT_BYTES,
-  MAX_EXPIRY_SECONDS,
   MAX_FILES_PER_BUNDLE,
   NONCE_BYTES,
   NONCE_PREFIX_BYTES,
@@ -130,6 +130,17 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   if (typeof body !== 'object' || body === null) throw new BadRequest('JSON の形式が不正です');
   return body as Record<string, unknown>;
 }
+
+/**
+ * このホストの上限値を公開する。セルフホストでは環境変数で変わるため、
+ * クライアントはビルド時の定数ではなくこの値を表示に使う。
+ */
+app.get('/api/config', (c) => {
+  return c.json({
+    maxFileSize: maxFileSize(c.env),
+    maxExpiryHours: maxExpiryHours(c.env),
+  });
+});
 
 /* ------------------------------------------------------------------ *
  * アップロード
@@ -296,7 +307,10 @@ app.post('/api/uploads/:token/complete', async (c) => {
   const body = await readJson(c.req.raw);
 
   const expiresIn = requireInt(body.expiresIn, 'expiresIn');
-  if (expiresIn <= 0 || expiresIn > MAX_EXPIRY_SECONDS) throw new BadRequest('有効期限が不正です');
+  const maxExpirySeconds = maxExpiryHours(c.env) * 3600;
+  if (expiresIn <= 0 || expiresIn > maxExpirySeconds) {
+    throw new BadRequest(`有効期限が不正です (上限 ${maxExpiryHours(c.env)} 時間)`);
+  }
 
   let maxDownloads: number | null = null;
   if (body.maxDownloads !== null && body.maxDownloads !== undefined) {

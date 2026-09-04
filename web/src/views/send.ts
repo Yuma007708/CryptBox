@@ -9,6 +9,10 @@ import { fromFile, fromNativePath, type FileSource } from '../filesource.js';
 import { isNative } from '../platform.js';
 import { keepAwake, pickDocuments, pickMedia } from '../native.js';
 import { EXPIRY_OPTIONS, MAX_FILES_PER_BUNDLE } from '../../../shared/format.js';
+import { getServerConfig } from '../server-config.js';
+
+/** /api/config が取れるまでの表示用フォールバック（サーバー既定値と同じ） */
+const FALLBACK_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
 
 const DOWNLOAD_LIMITS: Array<{ label: string; value: number | null }> = [
   { label: '1回まで', value: 1 },
@@ -236,6 +240,14 @@ export function renderSend(view: HTMLElement): void {
     ),
   );
 
+  const hintText = (maxFileSize: number) => `最大 ${MAX_FILES_PER_BUNDLE} ファイル・合計 ${formatBytes(maxFileSize)} まで`;
+  const nativeHint = h('p', { class: 'dropzone-hint' }, hintText(FALLBACK_MAX_FILE_SIZE));
+  const webHint = h('p', { class: 'dropzone-hint' }, hintText(FALLBACK_MAX_FILE_SIZE));
+  void getServerConfig().then((config) => {
+    nativeHint.textContent = hintText(config.maxFileSize);
+    webHint.textContent = hintText(config.maxFileSize);
+  });
+
   const dropzone = isNative
     ? h(
         'div',
@@ -244,7 +256,7 @@ export function renderSend(view: HTMLElement): void {
         h('p', { class: 'dropzone-title' }, '送るファイルを選ぶ'),
         h('p', { class: 'dropzone-or' }, '写真・動画は元データのまま（無変換）で取り込みます'),
         nativePickers,
-        h('p', { class: 'dropzone-hint' }, `最大 ${MAX_FILES_PER_BUNDLE} ファイル・合計 100 GiB まで`),
+        nativeHint,
       )
     : h(
         'div',
@@ -253,7 +265,7 @@ export function renderSend(view: HTMLElement): void {
         h('p', { class: 'dropzone-title' }, 'ファイルをドラッグ＆ドロップ'),
         h('p', { class: 'dropzone-or' }, 'または'),
         pickButton,
-        h('p', { class: 'dropzone-hint' }, `最大 ${MAX_FILES_PER_BUNDLE} ファイル・合計 100 GiB まで`),
+        webHint,
       );
 
   for (const type of ['dragenter', 'dragover'] as const) {

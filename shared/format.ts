@@ -73,15 +73,18 @@ export interface Argon2Params {
   hashLength: number;
 }
 
-/** 有効期限の選択肢 (秒) */
+/**
+ * 有効期限の選択肢 (秒)。
+ * 公開ホスト版は最長 7 日（`MAX_EXPIRY_HOURS`、既定 168 時間、`src/env.ts`）で
+ * サーバー側が強制する。ここに 7 日を超える選択肢を足す場合は、
+ * セルフホスト側で `MAX_EXPIRY_HOURS` も引き上げないとサーバーに拒否される。
+ */
 export const EXPIRY_OPTIONS = [
   { label: '1時間', seconds: 60 * 60 },
   { label: '24時間', seconds: 60 * 60 * 24 },
+  { label: '3日', seconds: 60 * 60 * 24 * 3 },
   { label: '7日', seconds: 60 * 60 * 24 * 7 },
-  { label: '30日', seconds: 60 * 60 * 24 * 30 },
 ] as const;
-
-export const MAX_EXPIRY_SECONDS = 60 * 60 * 24 * 30;
 
 /** 暗号化後のチャンク長 (末尾チャンク以外) */
 export function cipherChunkSize(chunkSize: number): number {

@@ -467,7 +467,57 @@ describe('入力検証', () => {
       `${ORIGIN}/api/uploads`,
       json({
         chunkSize: CHUNK_SIZE,
-        files: [{ plainSize: 600 * 1024 * 1024 }, { plainSize: 600 * 1024 * 1024 }],
+        files: [
+          { plainSize: 3 * 1024 * 1024 * 1024 },
+          { plainSize: 3 * 1024 * 1024 * 1024 },
+        ],
+      }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('合計サイズがちょうど上限 (5 GiB) なら通す', async () => {
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({
+        chunkSize: CHUNK_SIZE,
+        files: [{ plainSize: 5 * 1024 * 1024 * 1024 }],
+      }),
+    );
+    expect(response.status).toBe(200);
+  });
+
+  it('合計サイズが上限を 1 バイトでも超えると拒否する', async () => {
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({
+        chunkSize: CHUNK_SIZE,
+        files: [{ plainSize: 5 * 1024 * 1024 * 1024 + 1 }],
+      }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('有効期限がちょうど上限 (7 日) なら通す', async () => {
+    const uploaded = await upload([randomBytes(16)], { expiresIn: 7 * 24 * 60 * 60 });
+    expect(uploaded.token).toBeTruthy();
+  });
+
+  it('有効期限が上限を 1 秒でも超えると拒否する', async () => {
+    const created = await SELF.fetch(
+      `${ORIGIN}/api/uploads`,
+      json({ chunkSize: CHUNK_SIZE, files: [{ plainSize: 16 }] }),
+    );
+    const { uploadToken } = (await created.json()) as { uploadToken: string };
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/uploads/${uploadToken}/complete`,
+      json({
+        expiresIn: 7 * 24 * 60 * 60 + 1,
+        maxDownloads: null,
+        authHash: 'a'.repeat(64),
+        kdfSalt: toBase64Url(randomBytes(KDF_SALT_BYTES)),
+        hasPassword: false,
+        files: [],
       }),
     );
     expect(response.status).toBe(400);
@@ -496,6 +546,16 @@ describe('入力検証', () => {
       }),
     );
     expect(response.status).toBe(400);
+  });
+});
+
+describe('GET /api/config', () => {
+  it('このホストの上限値を返す', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/api/config`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { maxFileSize: number; maxExpiryHours: number };
+    expect(body.maxFileSize).toBe(5 * 1024 * 1024 * 1024);
+    expect(body.maxExpiryHours).toBe(168);
   });
 });
 
