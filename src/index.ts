@@ -12,6 +12,7 @@ import {
   turnstileHostnames,
   operatorName,
   operatorContact,
+  reportRetentionDays,
 } from './env.js';
 import {
   BadRequest,
@@ -108,12 +109,17 @@ function errorResponse(err: unknown): Response | null {
   return null;
 }
 
+/** `Authorization: Bearer <token>` からトークンを取り出す。スキームは大文字小文字を問わない */
+function extractBearer(header: string): string {
+  const match = /^bearer\s+(.*)$/i.exec(header);
+  return match ? match[1]! : '';
+}
+
 /** アップロード API を閉じたい場合は UPLOAD_TOKEN を設定する */
 function assertUploadAllowed(c: { req: { header: (name: string) => string | undefined }; env: Env }) {
   const expected = c.env.UPLOAD_TOKEN;
   if (!expected) return;
-  const header = c.req.header('authorization') ?? '';
-  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const presented = extractBearer(c.req.header('authorization') ?? '');
   if (!timingSafeEqual(presented, expected)) throw new BadRequest('アップロードが許可されていません');
 }
 
@@ -178,13 +184,16 @@ async function verifyTurnstile(
 }
 
 /**
- * IP あたりのアップロード回数を絞る（Workers Rate Limiting）。
- * `UPLOAD_LIMITER` binding が無ければ（ローカル・セルフホストの既定）制限しない。
+ * IP あたりの回数を絞る（Workers Rate Limiting）。
+ * `limiter` が無ければ（ローカル・セルフホストの既定）制限しない。
  */
-async function checkUploadRateLimit(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
-  if (!c.env.UPLOAD_LIMITER) return true;
+async function checkRateLimit(
+  c: { req: { header: (name: string) => string | undefined }; env: Env },
+  limiter: RateLimit | undefined,
+): Promise<boolean> {
+  if (!limiter) return true;
   const key = rateLimitKey(c.req.header('cf-connecting-ip'));
-  const { success } = await c.env.UPLOAD_LIMITER.limit({ key });
+  const { success } = await limiter.limit({ key });
   return success;
 }
 
@@ -214,32 +223,32 @@ export function rateLimitKey(ip: string | undefined): string {
 }
 
 /**
- * IP あたりの通報回数を絞る（Workers Rate Limiting）。
- * `REPORT_LIMITER` binding が無ければ（ローカル・セルフホストの既定）制限しない。
- */
-async function checkReportRateLimit(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
-  if (!c.env.REPORT_LIMITER) return true;
-  const { success } = await c.env.REPORT_LIMITER.limit({ key: rateLimitKey(c.req.header('cf-connecting-ip')) });
-  return success;
-}
-
-/**
  * 運営者による無効化 API (`/api/admin/*`) を保護する。
  * `ADMIN_TOKEN` 未設定、または `Authorization: Bearer` が一致しなければ
  * エンドポイント自体が存在しないかのように 404 を返す。
+ * 提示値・期待値の両方を SHA-256 で固定長にしてから比較する
+ * （timingSafeEqual は長さが違うと即 false を返すため、長さの違いが漏れるのを防ぐ）。
  */
-function checkAdminAuth(c: { req: { header: (name: string) => string | undefined }; env: Env }): boolean {
+async function checkAdminAuth(c: { req: { header: (name: string) => string | undefined }; env: Env }): Promise<boolean> {
   const expected = c.env.ADMIN_TOKEN;
   if (!expected) return false;
-  const header = c.req.header('authorization') ?? '';
-  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
-  return timingSafeEqual(presented, expected);
+  const presented = extractBearer(c.req.header('authorization') ?? '');
+  const [presentedHash, expectedHash] = await Promise.all([sha256Hex(presented), sha256Hex(expected)]);
+  return timingSafeEqual(presentedHash, expectedHash);
 }
 
 const REPORT_REASONS = new Set(['malware', 'illegal', 'copyright', 'other']);
 
-/** 同一バンドルへの通報記録の上限（無限増殖防止。IP・UA は保存しない） */
-const MAX_REPORTS_PER_BUNDLE = 20;
+/** 通報の detail の最大文字数（コードポイント数え） */
+const MAX_DETAIL_CODEPOINTS = 500;
+
+/**
+ * 制御文字 (Cc) とサロゲート単体 (Cs) を空白に置換する。改行 (\n) だけは残す。
+ * 通報の detail は自由入力なので、ログ・DB に制御文字が紛れ込むのを防ぐ。
+ */
+function sanitizeDetail(raw: string): string {
+  return raw.replace(/[\p{Cc}\p{Cs}]/gu, (ch) => (ch === '\n' ? ch : ' '));
+}
 
 function requireInt(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
@@ -294,7 +303,7 @@ interface UploadFileRow {
 app.post('/api/uploads', async (c) => {
   assertUploadAllowed(c);
 
-  if (!(await checkUploadRateLimit(c))) {
+  if (!(await checkRateLimit(c, c.env.UPLOAD_LIMITER))) {
     return c.json(
       { error: 'アップロードが多すぎます。しばらくしてから再度お試しください' },
       429,
@@ -1053,8 +1062,13 @@ async function deleteBundle(
  * 存在しないトークンでも同じ 200 を返す（存在オラクルにしない）。
  */
 app.post('/api/files/:token/report', async (c) => {
-  if (!(await checkReportRateLimit(c))) {
+  if (!(await checkRateLimit(c, c.env.REPORT_LIMITER))) {
     return c.json({ error: '通報が多すぎます。しばらくしてから再度お試しください' }, 429);
+  }
+
+  const contentType = c.req.header('content-type') ?? '';
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    return c.json({ error: 'Content-Type は application/json にしてください' }, 415);
   }
 
   const body = await readJson(c.req.raw);
@@ -1063,25 +1077,26 @@ app.post('/api/files/:token/report', async (c) => {
   }
   let detail: string | null = null;
   if (body.detail !== undefined && body.detail !== null) {
-    if (typeof body.detail !== 'string' || body.detail.length > 500) {
-      throw new BadRequest('detail が不正です（500 文字まで）');
+    if (typeof body.detail !== 'string' || [...body.detail].length > MAX_DETAIL_CODEPOINTS) {
+      throw new BadRequest(`detail が不正です（${MAX_DETAIL_CODEPOINTS} 文字まで）`);
     }
-    detail = body.detail;
+    detail = sanitizeDetail(body.detail);
   }
 
   const bundleId = await sha256Hex(c.req.param('token'));
-  const countRow = await c.env.DB.prepare(`SELECT COUNT(*) as n FROM reports WHERE bundle_id = ?`)
-    .bind(bundleId)
-    .first<{ n: number }>();
-  const count = countRow?.n ?? 0;
-
-  if (count < MAX_REPORTS_PER_BUNDLE) {
-    await c.env.DB.prepare(
-      `INSERT INTO reports (bundle_id, reason, detail, reported_at) VALUES (?, ?, ?, ?)`,
-    )
-      .bind(bundleId, body.reason, detail, Date.now())
-      .run();
-  }
+  // 同一バンドル・同一理由への通報は 1 行に集約し、件数だけ増やす。
+  // これにより行数は理由の種類数（4）で自然に上限化され、明示的な件数上限は不要。
+  // 応答パスにはバンドルの存在チェックを入れない（存在オラクルにしない）。
+  await c.env.DB.prepare(
+    `INSERT INTO reports (bundle_id, reason, detail, reported_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (bundle_id, reason) DO UPDATE SET
+       count = count + 1,
+       reported_at = excluded.reported_at,
+       detail = COALESCE(reports.detail, excluded.detail),
+       handled_at = NULL`,
+  )
+    .bind(bundleId, body.reason, detail, Date.now())
+    .run();
 
   return c.json({ ok: true });
 });
@@ -1090,19 +1105,21 @@ interface ReportRow {
   id: number;
   bundle_id: string;
   reason: string;
+  /** 通報者入力の untrusted な文字列。UI に出す場合はエスケープ必須 */
   detail: string | null;
+  count: number;
   reported_at: number;
 }
 
 /** 運営者向け: 未処理の通報一覧を新しい順に返す */
 app.get('/api/admin/reports', async (c) => {
-  if (!checkAdminAuth(c)) return c.json({ error: 'Not Found' }, 404);
+  if (!(await checkAdminAuth(c))) return c.json({ error: 'Not Found' }, 404);
 
   const requested = Number(c.req.query('limit') ?? '50');
   const limit = Number.isInteger(requested) && requested > 0 && requested <= 200 ? requested : 50;
 
   const rows = await c.env.DB.prepare(
-    `SELECT id, bundle_id, reason, detail, reported_at FROM reports
+    `SELECT id, bundle_id, reason, detail, count, reported_at FROM reports
       WHERE handled_at IS NULL
       ORDER BY reported_at DESC
       LIMIT ?`,
@@ -1116,6 +1133,7 @@ app.get('/api/admin/reports', async (c) => {
       bundleId: row.bundle_id,
       reason: row.reason,
       detail: row.detail,
+      count: row.count,
       reportedAt: row.reported_at,
     })),
   });
@@ -1124,9 +1142,11 @@ app.get('/api/admin/reports', async (c) => {
 /**
  * 運営者向け: 中身を見ずにリンク単位でバンドルを即時完全削除する。
  * 削除に成功したら、同じバンドルへの未処理の通報を処理済みにする。
+ * R2 の削除が一部失敗した場合は D1 を消さず `{ ok: false, deleted: false, pending }` を返す
+ * （500 にはしない）。takedown は冪等なので、そのまま再実行すればよい。
  */
 app.post('/api/admin/takedown', async (c) => {
-  if (!checkAdminAuth(c)) return c.json({ error: 'Not Found' }, 404);
+  if (!(await checkAdminAuth(c))) return c.json({ error: 'Not Found' }, 404);
 
   const body = await readJson(c.req.raw);
   if (!isHash(body.bundleId)) throw new BadRequest('bundleId が不正です');
@@ -1143,6 +1163,7 @@ app.post('/api/admin/takedown', async (c) => {
       return c.json({ ok: false, deleted: false, pending: result.pending });
     }
     deleted = true;
+    console.log(`takedown bundleId=${body.bundleId} at=${new Date().toISOString()}`);
     await c.env.DB.prepare(
       `UPDATE reports SET handled_at = ? WHERE bundle_id = ? AND handled_at IS NULL`,
     )
@@ -1190,10 +1211,24 @@ app.get('*', (c) => c.env.ASSETS.fetch(c.req.raw));
  * 自動削除 (Cron Trigger)
  * ------------------------------------------------------------------ */
 
+/** D1 (SQLite) の 1 クエリあたりの変数上限に収まるチャンクサイズ */
+const DELETE_CHUNK_SIZE = 100;
+
+/** id の配列を `DELETE FROM <table> WHERE id IN (...)` で一括削除する（変数上限のためチャンク分割） */
+async function deleteByIds(env: Env, table: 'reports', ids: number[]): Promise<void> {
+  for (let offset = 0; offset < ids.length; offset += DELETE_CHUNK_SIZE) {
+    const chunk = ids.slice(offset, offset + DELETE_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(',');
+    await env.DB.prepare(`DELETE FROM ${table} WHERE id IN (${placeholders})`)
+      .bind(...chunk)
+      .run();
+  }
+}
+
 export async function purge(
   env: Env,
   now = Date.now(),
-): Promise<{ bundles: number; uploads: number; receipts: number }> {
+): Promise<{ bundles: number; uploads: number; receipts: number; reports: number }> {
   const grace = downloadGraceMs(env);
   // 期限切れ、またはダウンロード上限に達したもの。
   // 上限到達後は finish 通知（アクティブ 0）で即座に、
@@ -1252,10 +1287,26 @@ export async function purge(
     .bind(receiptCutoff)
     .run();
 
+  // 保持期間を超えた通報。分割削除（1 回の purge で最大 500 件）。
+  // 残りは次回の Cron 実行で引き継がれる。
+  const retentionCutoff = now - reportRetentionDays(env) * 24 * 60 * 60 * 1000;
+  const oldReports = await env.DB.prepare(`SELECT id FROM reports WHERE reported_at <= ? LIMIT 500`)
+    .bind(retentionCutoff)
+    .all<{ id: number }>();
+  await deleteByIds(env, 'reports', oldReports.results.map((row) => row.id));
+
+  // バンドルが（takedown・期限切れ等で）既に消えている通報。応答パスでは存在チェックを
+  // 一切しない（存在オラクルにしないため）ので、ここで定期的に掃除する。
+  const orphanReports = await env.DB.prepare(
+    `SELECT id FROM reports WHERE bundle_id NOT IN (SELECT id FROM bundles) LIMIT 500`,
+  ).all<{ id: number }>();
+  await deleteByIds(env, 'reports', orphanReports.results.map((row) => row.id));
+
   return {
     bundles: expired.results.length,
     uploads: stale.results.length,
     receipts: purgedReceipts.meta.changes ?? 0,
+    reports: oldReports.results.length + orphanReports.results.length,
   };
 }
 
@@ -1265,7 +1316,7 @@ export default {
     ctx.waitUntil(
       purge(env).then((result) => {
         console.log(
-          `purged bundles=${result.bundles} uploads=${result.uploads} receipts=${result.receipts}`,
+          `purged bundles=${result.bundles} uploads=${result.uploads} receipts=${result.receipts} reports=${result.reports}`,
         );
       }),
     );

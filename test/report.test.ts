@@ -79,14 +79,79 @@ describe('POST /api/files/:token/report', () => {
     expect(body).toEqual({ ok: true });
   });
 
-  it('同一 bundle への通報は 20 件までしか記録しない', async () => {
+  it('同一 bundle・同一理由への通報は 1 行に集約され、count が増える', async () => {
     const token = 'repeat-token';
     for (let i = 0; i < 25; i++) {
       const response = await SELF.fetch(`${ORIGIN}/api/files/${token}/report`, json({ reason: 'copyright' }));
       expect(response.status).toBe(200);
     }
     const bundleId = await sha256Hex(token);
-    expect(await countReports(bundleId)).toBe(20);
+    expect(await countReports(bundleId)).toBe(1);
+    const row = await env.DB.prepare(`SELECT count, reason FROM reports WHERE bundle_id = ?`)
+      .bind(bundleId)
+      .first<{ count: number; reason: string }>();
+    expect(row?.count).toBe(25);
+    expect(row?.reason).toBe('copyright');
+  });
+
+  it('理由が違えば別の行になる', async () => {
+    const token = 'repeat-token-2';
+    await SELF.fetch(`${ORIGIN}/api/files/${token}/report`, json({ reason: 'malware' }));
+    await SELF.fetch(`${ORIGIN}/api/files/${token}/report`, json({ reason: 'illegal' }));
+    const bundleId = await sha256Hex(token);
+    expect(await countReports(bundleId)).toBe(2);
+  });
+
+  it('21 件目以降でも捨てられない（理由ごとに自然に上限化される）', async () => {
+    const token = 'repeat-token-3';
+    for (let i = 0; i < 21; i++) {
+      const response = await SELF.fetch(`${ORIGIN}/api/files/${token}/report`, json({ reason: 'other' }));
+      expect(response.status).toBe(200);
+    }
+    const bundleId = await sha256Hex(token);
+    const row = await env.DB.prepare(`SELECT count FROM reports WHERE bundle_id = ?`)
+      .bind(bundleId)
+      .first<{ count: number }>();
+    expect(row?.count).toBe(21);
+  });
+
+  it('Content-Type が application/json でなければ 415', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/api/files/some-token/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ reason: 'other' }),
+    });
+    expect(response.status).toBe(415);
+  });
+
+  it('絵文字 500 個（コードポイント数）は通る', async () => {
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/some-token/report`,
+      json({ reason: 'other', detail: '😀'.repeat(500) }),
+    );
+    expect(response.status).toBe(200);
+  });
+
+  it('絵文字 501 個（コードポイント数）は 400', async () => {
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/some-token/report`,
+      json({ reason: 'other', detail: '😀'.repeat(501) }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('制御文字は空白に置換されて保存される（改行は残す）', async () => {
+    const token = 'control-char-token';
+    const response = await SELF.fetch(
+      `${ORIGIN}/api/files/${token}/report`,
+      json({ reason: 'other', detail: 'line1\nbad\x00char\x1fhere' }),
+    );
+    expect(response.status).toBe(200);
+    const bundleId = await sha256Hex(token);
+    const row = await env.DB.prepare(`SELECT detail FROM reports WHERE bundle_id = ?`)
+      .bind(bundleId)
+      .first<{ detail: string }>();
+    expect(row?.detail).toBe('line1\nbad char here');
   });
 });
 

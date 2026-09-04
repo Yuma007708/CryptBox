@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS deletion_receipts (
   bundle_id         TEXT PRIMARY KEY,
   created_at        INTEGER NOT NULL,
   deleted_at        INTEGER NOT NULL,
-  reason            TEXT NOT NULL,          -- 'expired' | 'limit_reached' | 'sender_deleted'
+  reason            TEXT NOT NULL,          -- 'expired' | 'limit_reached' | 'sender_deleted' | 'takedown'
   file_count        INTEGER NOT NULL,
   total_plain_size  INTEGER NOT NULL,
   signature         TEXT NOT NULL,          -- base64url(HMAC-SHA256)
@@ -95,15 +95,18 @@ CREATE TABLE IF NOT EXISTS deletion_receipts (
 
 CREATE INDEX IF NOT EXISTS idx_deletion_receipts_deleted_at ON deletion_receipts (deleted_at);
 
--- 通報。IP・UA は保存しない。中身は見えないのでリンク単位でしか止められない
+-- 通報。IP・UA は保存しない。中身は見えないのでリンク単位でしか止められない。
+-- 同一バンドル・同一理由の通報は 1 行に集約し、件数だけ増やす（UNIQUE(bundle_id, reason)）
 CREATE TABLE IF NOT EXISTS reports (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   bundle_id   TEXT NOT NULL,
   reason      TEXT NOT NULL,
   detail      TEXT,
+  count       INTEGER NOT NULL DEFAULT 1,
   reported_at INTEGER NOT NULL,
   -- 運営者が takedown を実行した時刻。NULL = 未処理
-  handled_at  INTEGER
+  handled_at  INTEGER,
+  UNIQUE (bundle_id, reason)
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_bundle_id ON reports (bundle_id);

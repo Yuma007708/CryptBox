@@ -105,6 +105,12 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 処理済みになって以降 `/api/admin/reports` には出てきません（存在しない `bundleId` の場合は
 `deleted:false`）。R2 のオブジェクトと D1 の行はこの時点で完全に削除され、復元できません。
 
+**takedown は冪等です。** R2 側の削除が一部失敗した場合（ネットワーク瞬断など）は D1 の行を
+残したまま `{"ok":false,"deleted":false,"pending":["<失敗した r2_key>", ...]}` を返します
+（500 エラーにはしません）。この場合は同じ `bundleId` でそのまま `takedown` を再実行してください。
+成功するまで D1 の行と `bundle_files` は残り続けるので、途中で R2 の孤児オブジェクトと
+D1 だけ消えた不整合な状態にはなりません。
+
 通報 API (`POST /api/files/:token/report`) にも IP あたりのレート制限を掛けたい場合、
 `wrangler.jsonc` の `ratelimits` に `REPORT_LIMITER` を追加します（既定で入っています）。
 挙動は 6 節の `UPLOAD_LIMITER` と同じです。

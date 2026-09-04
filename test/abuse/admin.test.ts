@@ -1,5 +1,5 @@
 import { SELF, env } from 'cloudflare:test';
-import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applySchema, resetTables } from '../helpers.js';
 import {
   deriveAuthToken,
@@ -154,6 +154,38 @@ describe('POST /api/admin/takedown（ADMIN_TOKEN 設定済み）', () => {
     const response = await SELF.fetch(`${ORIGIN}/api/admin/takedown`, authed({ bundleId: 'not-a-hash' }));
     expect(response.status).toBe(400);
   });
+
+  describe('R2 の削除が失敗する場合', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('失敗したキーが残っていれば D1 を消さず ok:false, pending を返す。再実行で消える', async () => {
+      const { bundleId } = await uploadBundle();
+
+      const spy = vi.spyOn(env.BUCKET, 'delete').mockRejectedValueOnce(new Error('R2 down'));
+
+      const response = await SELF.fetch(`${ORIGIN}/api/admin/takedown`, authed({ bundleId }));
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { ok: boolean; deleted: boolean; pending?: string[] };
+      expect(body.ok).toBe(false);
+      expect(body.deleted).toBe(false);
+      expect(body.pending?.length).toBeGreaterThan(0);
+
+      // D1 行はまだ残っている（冪等に再実行できる）
+      const bundleRow = await env.DB.prepare(`SELECT id FROM bundles WHERE id = ?`).bind(bundleId).first();
+      expect(bundleRow).not.toBeNull();
+
+      spy.mockRestore();
+      const retry = await SELF.fetch(`${ORIGIN}/api/admin/takedown`, authed({ bundleId }));
+      expect(retry.status).toBe(200);
+      const retryBody = (await retry.json()) as { ok: boolean; deleted: boolean };
+      expect(retryBody).toEqual({ ok: true, deleted: true });
+
+      const gone = await env.DB.prepare(`SELECT id FROM bundles WHERE id = ?`).bind(bundleId).first();
+      expect(gone).toBeNull();
+    });
+  });
 });
 
 describe('GET /api/admin/reports（ADMIN_TOKEN 設定済み）', () => {
@@ -162,8 +194,9 @@ describe('GET /api/admin/reports（ADMIN_TOKEN 設定済み）', () => {
     expect(response.status).toBe(404);
   });
 
-  it('新しい順に未処理の通報を返す', async () => {
+  it('新しい順に未処理の通報を返す（count も含む）', async () => {
     await SELF.fetch(`${ORIGIN}/api/files/token-a/report`, json({ reason: 'malware' }));
+    await SELF.fetch(`${ORIGIN}/api/files/token-b/report`, json({ reason: 'illegal' }));
     await SELF.fetch(`${ORIGIN}/api/files/token-b/report`, json({ reason: 'illegal' }));
 
     const response = await SELF.fetch(`${ORIGIN}/api/admin/reports?limit=50`, {
@@ -171,11 +204,13 @@ describe('GET /api/admin/reports（ADMIN_TOKEN 設定済み）', () => {
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
-      reports: Array<{ bundleId: string; reason: string; reportedAt: number }>;
+      reports: Array<{ bundleId: string; reason: string; reportedAt: number; count: number }>;
     };
     expect(body.reports).toHaveLength(2);
     expect(body.reports[0]!.reason).toBe('illegal');
+    expect(body.reports[0]!.count).toBe(2);
     expect(body.reports[1]!.reason).toBe('malware');
+    expect(body.reports[1]!.count).toBe(1);
   });
 
   it('処理済みの通報は返さない', async () => {

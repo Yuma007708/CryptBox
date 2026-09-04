@@ -63,6 +63,9 @@ export interface Env {
 
   /** `GET /api/config` で公開する運営者の連絡先。未設定ならヘルプの節を省略する */
   OPERATOR_CONTACT?: string;
+
+  /** 通報記録を保持する日数。未設定なら 90 日 */
+  REPORT_RETENTION_DAYS?: string;
 }
 
 export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
@@ -140,4 +143,13 @@ export function operatorName(env: Env): string | null {
 /** 運営者の連絡先。未設定ならヘルプの「運営者情報」節を省略する */
 export function operatorContact(env: Env): string | null {
   return env.OPERATOR_CONTACT?.trim() || null;
+}
+
+/** 既定の通報保持日数 */
+export const DEFAULT_REPORT_RETENTION_DAYS = 90;
+
+/** 通報記録を保持する日数。未設定・不正な値なら既定 (90 日) */
+export function reportRetentionDays(env: Env): number {
+  const parsed = Number(env.REPORT_RETENTION_DAYS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REPORT_RETENTION_DAYS;
 }

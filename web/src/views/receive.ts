@@ -43,6 +43,13 @@ export function renderReceive(root: HTMLElement, token: string): void {
     h('p', { class: 'receive-tagline' }, '暗号化して、安全に送る。'),
     alert,
     body,
+    // エラー画面・パスワード入力画面でも通報できるよう、シェル側に常時 1 つだけ置く
+    reportSection(),
+    h(
+      'p',
+      { class: 'receive-footer' },
+      h('a', { href: '/help#terms' }, '利用規約・プライバシー'),
+    ),
   );
   root.append(h('div', { class: 'receive' }, inner));
 
@@ -488,7 +495,6 @@ export function renderReceive(root: HTMLElement, token: string): void {
           { class: 'hint' },
           '復号はこのブラウザ内で行われます。サーバーは鍵もファイル名も持っていません。',
         ),
-        reportSection(),
       ),
     );
   }

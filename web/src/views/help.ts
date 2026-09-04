@@ -68,7 +68,7 @@ export function renderHelp(view: HTMLElement): void {
         h('li', {}, '受信トレイやアカウント管理（本アプリはアカウントを持ちません）'),
       ),
 
-      h('h3', {}, '利用規約'),
+      h('h3', { id: 'terms' }, '利用規約'),
       h(
         'p',
         {},
@@ -100,7 +100,12 @@ export function renderHelp(view: HTMLElement): void {
       h('ul', {},
         h('li', {}, '復号鍵（URL の「#」より後ろで、サーバーには送信されません）'),
         h('li', {}, 'ファイル名・ファイルの中身'),
-        h('li', {}, 'アクセス元の IP アドレス（通報を含め記録しません）'),
+        h(
+          'li',
+          {},
+          'CryptBox のデータベースには IP アドレスを保存しません。濫用防止のため、',
+          'Cloudflare の基盤側でレート制限や Turnstile に一時的に用いる場合があります。',
+        ),
         h('li', {}, 'アカウント情報（本アプリはアカウントを持ちません）'),
       ),
       h(
@@ -108,6 +113,7 @@ export function renderHelp(view: HTMLElement): void {
         {},
         '広告枠が有効な場合、追跡型（パーソナライズ）広告は使用せず、Cookie も設置しません。',
         'Cloudflare Turnstile を使用する場合、ページの読み込みに伴い Cloudflare にアクセス情報が渡ります。',
+        '設定と送信履歴はこの端末の localStorage にのみ保存されます。',
       ),
 
       h('h3', {}, '通報について'),
