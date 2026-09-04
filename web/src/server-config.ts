@@ -3,6 +3,7 @@ import { getJson } from './api.js';
 export interface ServerConfig {
   maxFileSize: number;
   maxExpiryHours: number;
+  adsEnabled: boolean;
   /** Cloudflare Turnstile のサイトキー。未設定（セルフホストで無効化）なら null */
   turnstileSiteKey: string | null;
   /** 運営者名。未設定ならヘルプの「運営者情報」節を省略する */
@@ -20,6 +21,7 @@ export interface ServerConfig {
 const FALLBACK: ServerConfig = {
   maxFileSize: 5 * 1024 * 1024 * 1024,
   maxExpiryHours: 168,
+  adsEnabled: false,
   turnstileSiteKey: null,
   operatorName: null,
   operatorContact: null,

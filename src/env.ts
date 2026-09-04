@@ -28,6 +28,9 @@ export interface Env {
    */
   APP_ORIGINS?: string;
 
+  /** "1" のとき広告枠（ダミー）を表示する。未設定なら無効 */
+  ADS_ENABLED?: string;
+
   /** Turnstile のサイトキー（公開値）。クライアントに `GET /api/config` で返す */
   TURNSTILE_SITE_KEY?: string;
 
@@ -94,6 +97,11 @@ export function maxFileSize(env: Env): number {
 export function maxExpiryHours(env: Env): number {
   const parsed = Number(env.MAX_EXPIRY_HOURS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_EXPIRY_HOURS;
+}
+
+/** 広告枠（ダミー）を表示するか。広告ネットワークは未接続で、レイアウトのみ */
+export function adsEnabled(env: Env): boolean {
+  return env.ADS_ENABLED === '1';
 }
 
 export function downloadGraceMs(env: Env): number {

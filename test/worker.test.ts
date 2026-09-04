@@ -556,12 +556,14 @@ describe('GET /api/config', () => {
     const body = (await response.json()) as {
       maxFileSize: number;
       maxExpiryHours: number;
+      adsEnabled: boolean;
       turnstileSiteKey: string | null;
     };
     expect(body.maxFileSize).toBe(5 * 1024 * 1024 * 1024);
     expect(body.maxExpiryHours).toBe(168);
     // TURNSTILE_SITE_KEY 未設定（このプロジェクトの既定）なら null
     expect(body.turnstileSiteKey).toBeNull();
+    expect(body.adsEnabled).toBe(false);
   });
 });
 

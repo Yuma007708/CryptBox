@@ -1,4 +1,5 @@
 import { clear, h } from '../dom.js';
+import { adSlot } from '../ads.js';
 import { brandMark, extensionLabel, icon } from '../icons.js';
 import { formatBytes, formatDateTime, formatDuration } from '../format.js';
 import { deriveAuthToken } from '../crypto.js';
@@ -467,6 +468,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
     });
 
     body.append(
+      adSlot('receive-top'),
       h(
         'div',
         { class: 'card' },
@@ -496,6 +498,7 @@ export function renderReceive(root: HTMLElement, token: string): void {
           '復号はこのブラウザ内で行われます。サーバーは鍵もファイル名も持っていません。',
         ),
       ),
+      adSlot('receive-bottom'),
     );
   }
 }

@@ -8,6 +8,7 @@ import {
   maxExpiryHours,
   allowedAppOrigins,
   receiptRetentionMs,
+  adsEnabled,
   turnstileSiteKey,
   turnstileHostnames,
   operatorName,
@@ -276,6 +277,7 @@ app.get('/api/config', (c) => {
   return c.json({
     maxFileSize: maxFileSize(c.env),
     maxExpiryHours: maxExpiryHours(c.env),
+    adsEnabled: adsEnabled(c.env),
     turnstileSiteKey: turnstileSiteKey(c.env),
     operatorName: operatorName(c.env),
     operatorContact: operatorContact(c.env),
