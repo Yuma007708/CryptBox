@@ -1,5 +1,5 @@
 /** 外部リソースを使わないためのインライン SVG アイコン（stroke ベース） */
-const PATHS: Record<string, string> = {
+const PATHS: Record<string, string> = Object.assign(Object.create(null) as Record<string, string>, {
   upload:
     '<path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.5 8.24"/><path d="M12 21v-9m0 0 4 4m-4-4-4 4"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
@@ -22,7 +22,7 @@ const PATHS: Record<string, string> = {
   copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   refresh: '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
-};
+});
 
 export function icon(name: keyof typeof PATHS | string, className = 'icon'): SVGSVGElement {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -34,7 +34,9 @@ export function icon(name: keyof typeof PATHS | string, className = 'icon'): SVG
   svg.setAttribute('stroke-linejoin', 'round');
   svg.setAttribute('aria-hidden', 'true');
   svg.setAttribute('class', className);
-  svg.innerHTML = PATHS[name] ?? PATHS.file!;
+  // PATHS は prototype なしのオブジェクト。念のため自前プロパティかを確認してから引く
+  // （'constructor' 等の名前で prototype 由来の値を引き当てられないようにする）
+  svg.innerHTML = Object.hasOwn(PATHS, name) ? PATHS[name]! : PATHS.file!;
   return svg;
 }
 

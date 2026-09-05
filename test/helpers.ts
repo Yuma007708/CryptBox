@@ -24,5 +24,6 @@ export async function resetTables(): Promise<void> {
     env.DB.prepare('DELETE FROM uploads'),
     env.DB.prepare('DELETE FROM deletion_receipts'),
     env.DB.prepare('DELETE FROM reports'),
+    env.DB.prepare('DELETE FROM grant_uses'),
   ]);
 }

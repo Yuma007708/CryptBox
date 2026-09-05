@@ -74,6 +74,41 @@ export interface Argon2Params {
 }
 
 /**
+ * 受け入れる Argon2id パラメータの範囲。
+ *
+ * 下限は「弱すぎる KDF を押し付けられない」ため（受信者は送信者が指定した
+ * パラメータでパスワードを伸長するので、範囲を絞らないと総当たりが容易になる）。
+ * 上限は「受信者のブラウザを固めさせない」ため（メモリ 256 MiB / 反復 10 を超える
+ * 指定は、受信者側でのメモリ枯渇・ハングを狙った DoS になりうる）。
+ * hashLength は KEK 導出の入力長なので固定値のみ受け付ける。
+ */
+export const ARGON2_LIMITS = {
+  memoryKiB: { min: 16384, max: 262144 },
+  iterations: { min: 1, max: 10 },
+  parallelism: { min: 1, max: 4 },
+  hashLength: KEY_BYTES,
+} as const;
+
+function inRange(value: unknown, range: { min: number; max: number }): boolean {
+  return typeof value === 'number' && Number.isInteger(value) && value >= range.min && value <= range.max;
+}
+
+/**
+ * Argon2id パラメータが型・範囲ともに妥当かを検証する。
+ * 送信側（complete のサーバー検証）と受信側（復号前）の両方で使う。
+ */
+export function validateArgon2Params(value: unknown): value is Argon2Params {
+  if (typeof value !== 'object' || value === null) return false;
+  const params = value as Record<string, unknown>;
+  return (
+    inRange(params.memoryKiB, ARGON2_LIMITS.memoryKiB) &&
+    inRange(params.iterations, ARGON2_LIMITS.iterations) &&
+    inRange(params.parallelism, ARGON2_LIMITS.parallelism) &&
+    params.hashLength === ARGON2_LIMITS.hashLength
+  );
+}
+
+/**
  * 有効期限の選択肢 (秒)。
  * 公開ホスト版は最長 7 日（`MAX_EXPIRY_HOURS`、既定 168 時間、`src/env.ts`）で
  * サーバー側が強制する。ここに 7 日を超える選択肢を足す場合は、

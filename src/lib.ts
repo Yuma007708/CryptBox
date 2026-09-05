@@ -50,7 +50,17 @@ export function isHash(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 }
 
+/** グラント / レシートの署名鍵が使える状態か。未設定・短すぎる鍵は署名を許さない */
+export function isUsableSecret(secret: unknown, minLength: number): secret is string {
+  return typeof secret === 'string' && secret.length >= minLength;
+}
+
 async function hmacKey(secret: string): Promise<CryptoKey> {
+  // 呼び出し側（リクエスト先頭のミドルウェア）で弾いているはずだが、
+  // 「空の鍵で署名してしまう」ことだけは絶対に起こさない
+  if (typeof secret !== 'string' || secret.length === 0) {
+    throw new Error('GRANT_SECRET is not configured');
+  }
   return crypto.subtle.importKey(
     'raw',
     textEncoder.encode(secret) as BufferSource,
@@ -61,41 +71,66 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
 }
 
 /**
+ * 鍵付きハッシュ (HMAC-SHA256) の hex。
+ * `sha256(message + secret)` と違い長さ延長攻撃の余地がなく、鍵と本文の
+ * 境界も曖昧にならないため、IP のような短い入力の匿名化にはこちらを使う。
+ */
+export async function hmacHex(secret: string, message: string): Promise<string> {
+  const key = await hmacKey(secret);
+  const sig = await crypto.subtle.sign('HMAC', key, textEncoder.encode(message) as BufferSource);
+  return toHex(new Uint8Array(sig));
+}
+
+/** グラントに埋め込む一意 ID (jti) のバイト数 */
+export const GRANT_JTI_BYTES = 16;
+
+/**
  * ダウンロードグラント: ダウンロード回数を消費した証明。
  * これを持つ間は回数を再消費せずにレンジ取得・再開ができる。
+ *
+ * 形式: `<fileId>.<expiresAt>.<jti>.<signature>`
+ * jti は 16 バイトの乱数で、`/finish` が「同じグラントでの二重の完了通知」を
+ * 弾くための一意キーになる（grant_uses テーブル）。
  */
 export async function signGrant(secret: string, fileId: string, expiresAt: number): Promise<string> {
-  const payload = `${fileId}.${expiresAt}`;
+  const jti = toBase64Url(randomBytes(GRANT_JTI_BYTES));
+  const payload = `${fileId}.${expiresAt}.${jti}`;
   const key = await hmacKey(secret);
   const sig = await crypto.subtle.sign('HMAC', key, textEncoder.encode(payload) as BufferSource);
   return `${payload}.${toBase64Url(new Uint8Array(sig))}`;
 }
 
+/**
+ * グラントを検証し、有効なら jti を返す（無効なら null）。
+ * 呼び出し側は jti を使って二重消費を判定できる。
+ */
 export async function verifyGrant(
   secret: string,
   grant: string,
   fileId: string,
   now: number,
-): Promise<boolean> {
+): Promise<string | null> {
   const parts = grant.split('.');
-  if (parts.length !== 3) return false;
-  const [id, expText, sig] = parts;
-  if (!timingSafeEqual(id, fileId)) return false;
+  if (parts.length !== 4) return null;
+  const [id, expText, jti, sig] = parts;
+  if (!timingSafeEqual(id!, fileId)) return null;
+  if (!jti) return null;
   const expiresAt = Number(expText);
-  if (!Number.isFinite(expiresAt) || expiresAt <= now) return false;
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) return null;
   const key = await hmacKey(secret);
   let signature: Uint8Array;
   try {
-    signature = fromBase64Url(sig);
+    signature = fromBase64Url(sig!);
   } catch {
-    return false;
+    return null;
   }
-  return crypto.subtle.verify(
+  const valid = await crypto.subtle.verify(
     'HMAC',
     key,
     signature as BufferSource,
-    textEncoder.encode(`${id}.${expText}`) as BufferSource,
+    textEncoder.encode(`${id}.${expText}.${jti}`) as BufferSource,
   );
+  return valid ? jti : null;
 }
 
 /**

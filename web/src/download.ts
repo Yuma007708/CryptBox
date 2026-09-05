@@ -13,6 +13,7 @@ import {
   GCM_TAG_BYTES,
   fromBase64Url,
   toBase64Url,
+  validateArgon2Params,
 } from '../../shared/format.js';
 import type { DeletionReceipt } from '../../shared/receipt.js';
 
@@ -45,6 +46,17 @@ export interface BundleInfo {
 export class WrongPassword extends Error {
   constructor() {
     super('パスワードが違います');
+  }
+}
+
+/**
+ * サーバーから渡された Argon2id パラメータが許容範囲外だったときのエラー。
+ * サーバー側でも検証しているが、受信者は「サーバーを信用せずに」自分で確かめる
+ * （弱すぎるパラメータでの復号も、巨大なメモリ指定でのブラウザ枯渇も拒否する）。
+ */
+export class UnsafeKdfParams extends Error {
+  constructor() {
+    super('この共有リンクの鍵導出パラメータが安全な範囲外です。復号を中止しました。');
   }
 }
 
@@ -118,6 +130,11 @@ export async function openBundle(
   linkSecret: Uint8Array,
   password: string,
 ): Promise<OpenedBundle> {
+  // パスワード付きなら、サーバーが返した KDF パラメータを使う前に自分で検証する
+  if (info.hasPassword && !validateArgon2Params(info.pwParams)) {
+    throw new UnsafeKdfParams();
+  }
+
   const keys = await deriveKeys({
     linkSecret,
     kdfSalt: fromBase64Url(info.kdfSalt),
@@ -174,6 +191,29 @@ export async function pingDownload(token: string, grant: string): Promise<void> 
   await postJson(`/api/files/${encodeURIComponent(token)}/ping`, { grant });
 }
 
+export interface RefreshedGrant {
+  grant: string;
+  expiresAt: number;
+}
+
+/**
+ * 現行グラントの有効期限を延長する。`claim` と違ってダウンロード回数を消費しない。
+ * 失敗（403/404 = グラント無効・リンク失効）した場合は claim へフォールバックしない
+ * — 呼び出し側で回数を消費させないため。
+ */
+export async function refreshGrant(
+  token: string,
+  authToken: Uint8Array,
+  grant: string,
+): Promise<RefreshedGrant> {
+  return postJson<RefreshedGrant>(
+    `/api/files/${encodeURIComponent(token)}/refresh`,
+    { authToken: toBase64Url(authToken) },
+    undefined,
+    { 'X-Grant': grant },
+  );
+}
+
 /**
  * ダウンロード完了（またはページ離脱）を通知する。
  * 回数上限に達していれば、サーバーはこの時点でバンドルを完全削除する。
@@ -187,7 +227,8 @@ export async function finishDownload(
 
 /** ページ離脱時用。レスポンスを待たずに finish を送る */
 export function finishDownloadBeacon(token: string, grant: string): void {
-  const url = `/api/files/${encodeURIComponent(token)}/finish`;
+  // アプリ版は API が別オリジンなので、相対パスではなく apiUrl() を通す
+  const url = apiUrl(`/api/files/${encodeURIComponent(token)}/finish`);
   const body = new Blob([JSON.stringify({ grant })], { type: 'application/json' });
   if (!navigator.sendBeacon?.(url, body)) {
     void fetch(url, { method: 'POST', body, keepalive: true }).catch(() => undefined);
@@ -228,16 +269,14 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let buffer: Uint8Array[] = [];
   let buffered = 0;
+  let retryAfterMs: number | null = null;
 
   async function openStream(): Promise<void> {
-    const url = apiUrl(
-      `/api/files/${encodeURIComponent(token)}/files/${file.index}/blob` +
-        `?g=${encodeURIComponent(grant)}`,
-    );
-    const response = await fetch(url, {
-      headers: cipherOffset > 0 ? { Range: `bytes=${cipherOffset}-` } : {},
-      signal,
-    });
+    const url = apiUrl(`/api/files/${encodeURIComponent(token)}/files/${file.index}/blob`);
+    // グラントはクエリではなくヘッダーで送る（URL はログ・Referer・履歴に残るため）
+    const headers: Record<string, string> = { 'X-Grant': grant };
+    if (cipherOffset > 0) headers.Range = `bytes=${cipherOffset}-`;
+    const response = await fetch(url, { headers, signal });
     if (!response.ok) {
       let message = `HTTP ${response.status}`;
       try {
@@ -245,6 +284,12 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
         if (body.error) message = body.error;
       } catch {
         /* ignore */
+      }
+      if (response.status === 429) {
+        const retryAfter = Number(response.headers.get('Retry-After'));
+        retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(90_000, retryAfter * 1000)
+          : null;
       }
       throw new ApiError(message, response.status);
     }
@@ -311,7 +356,9 @@ export function decryptedStream(options: StreamOptions): ReadableStream<Uint8Arr
         reader = null;
         buffer = [];
         buffered = 0;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(8000, 500 * 2 ** attempts)));
+        const wait = retryAfterMs ?? Math.min(8000, 500 * 2 ** attempts);
+        retryAfterMs = null;
+        await new Promise((resolve) => setTimeout(resolve, wait));
       }
     }
     return null;

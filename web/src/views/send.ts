@@ -182,48 +182,46 @@ export function renderSend(view: HTMLElement): void {
   );
   right.append(optionsCard);
 
-  /* ---------------- Turnstile（見えないウィジェット） ---------------- */
+  /* ---------------- Turnstile（送信時だけ生成する） ---------------- */
 
+  // ウィジェットは常駐させない。送信ボタンを押したときに生成し、
+  // トークンを取り出したら即 remove() してコンテナを空にする。
+  // これにより、共有リンク（`#` 以降に復号鍵を含む）を表示する完了画面では
+  // 外部 script 由来の DOM が一切残らない。
   const turnstileContainer = h('div', { class: 'turnstile-container' });
-  const turnstileErrorBox = h('div', { class: 'alert', hidden: true });
-  right.append(turnstileContainer, turnstileErrorBox);
-  let turnstileWidget: TurnstileWidget | null = null;
+  right.append(turnstileContainer);
 
-  function initTurnstile(siteKey: string): void {
-    turnstileErrorBox.hidden = true;
-    clear(turnstileContainer);
-    createTurnstileWidget(turnstileContainer, siteKey)
-      .then((widget) => {
-        turnstileWidget = widget;
-      })
-      .catch((error) => {
-        console.error('Turnstile の初期化に失敗しました', error);
-        clear(turnstileErrorBox);
-        turnstileErrorBox.append(
-          icon('shield', 'icon-sm'),
-          h(
-            'span',
-            {},
-            '認証の読み込みに失敗しました。広告ブロッカーを無効にするか、時間をおいて再度お試しください',
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              class: 'ghost',
-              on: { click: () => initTurnstile(siteKey) },
-            },
-            '再試行',
-          ),
-        );
-        turnstileErrorBox.hidden = false;
-      });
+  /**
+   * 送信のたびにウィジェットを作ってトークンを 1 つ取り出し、必ず撤去する。
+   * Turnstile が無効（サイトキー未設定）なら undefined を返す。
+   */
+  async function requestTurnstileToken(onStage: (text: string) => void): Promise<string | undefined> {
+    const config = await getServerConfig();
+    if (!config.turnstileSiteKey) return undefined;
+
+    onStage('認証しています…');
+    let widget: TurnstileWidget;
+    try {
+      widget = await createTurnstileWidget(turnstileContainer, config.turnstileSiteKey);
+    } catch (error) {
+      console.error('Turnstile の初期化に失敗しました', error);
+      clear(turnstileContainer);
+      throw new Error(
+        '認証の読み込みに失敗しました。広告ブロッカーを無効にするか、時間をおいて再度お試しください',
+      );
+    }
+
+    try {
+      return await widget.getToken();
+    } catch (error) {
+      throw new Error(
+        describeError(error) || '認証に失敗しました。ページを再読み込みしてください',
+      );
+    } finally {
+      widget.remove();
+      clear(turnstileContainer);
+    }
   }
-
-  void getServerConfig().then((config) => {
-    if (!config.turnstileSiteKey) return;
-    initTurnstile(config.turnstileSiteKey);
-  });
 
   /* ---------------- 左カラム ---------------- */
 
@@ -615,15 +613,9 @@ export function renderSend(view: HTMLElement): void {
     await keepAwake(true);
 
     try {
-      let turnstileToken: string | undefined;
-      if (turnstileWidget) {
-        ui.stage.textContent = '認証しています…';
-        try {
-          turnstileToken = await turnstileWidget.getToken();
-        } catch (error) {
-          throw new Error(describeError(error) || '認証に失敗しました。ページを再読み込みしてください');
-        }
-      }
+      const turnstileToken = await requestTurnstileToken((text) => {
+        ui.stage.textContent = text;
+      });
 
       const result = await uploadBundle({
         files,

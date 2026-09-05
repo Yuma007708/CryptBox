@@ -22,6 +22,36 @@ interface Attributes {
   on?: Partial<{ [K in keyof HTMLElementEventMap]: (event: HTMLElementEventMap[K]) => void }>;
 }
 
+/**
+ * URL を取る属性。値は allowlist で検査してから設定する。
+ * `formAction` / `xlinkHref` のようなキャメルケース指定（コロン区切りの
+ * `xlink:href` も含む）も同じ属性として扱えるよう、小文字化して比較する。
+ */
+const URL_ATTRIBUTES = new Set(['href', 'src', 'action', 'formaction', 'xlinkhref', 'poster']);
+
+function normalizeAttrKey(key: string): string {
+  return key.toLowerCase().replace(/[:-]/g, '');
+}
+
+const SAFE_SCHEMES = new Set(['http:', 'https:', 'mailto:']);
+
+/**
+ * `javascript:` / `data:` / `vbscript:` などのスクリプト実行可能な URL を弾く。
+ * 許可するのは http / https / mailto と、`/` `#` `.` で始まる相対パスのみ。
+ */
+export function isSafeUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed === '') return false;
+  // 相対パス（プロトコル相対 `//host` はオリジンが変わるので除外）
+  if (trimmed.startsWith('//')) return false;
+  if (/^[/#.]/.test(trimmed)) return true;
+  try {
+    return SAFE_SCHEMES.has(new URL(trimmed, 'https://cryptbox.invalid/').protocol);
+  } catch {
+    return false;
+  }
+}
+
 export function h<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   attributes: Attributes = {},
@@ -32,6 +62,10 @@ export function h<K extends keyof HTMLElementTagNameMap>(
 
   for (const [key, value] of Object.entries(rest)) {
     if (value === undefined || value === null || value === false) continue;
+    if (URL_ATTRIBUTES.has(normalizeAttrKey(key)) && !isSafeUrl(String(value))) {
+      console.warn(`h(): 安全でない URL のため ${key} を無視しました`, value);
+      continue;
+    }
     if (key === 'class') node.className = String(value);
     else if (key === 'readOnly') (node as HTMLInputElement).readOnly = Boolean(value);
     else if (key === 'autocomplete') node.setAttribute('autocomplete', String(value));

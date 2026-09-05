@@ -38,7 +38,7 @@ const CHUNK_SIZE = 5 * 1024 * 1024;
  * ここで検証したいサーバー側の振る舞いは変わらない。
  * Argon2id 自体は test/node/argon2.test.ts で検証している。
  */
-const ARGON2_PARAMS = { memoryKiB: 1024, iterations: 1, parallelism: 1, hashLength: 32 };
+const ARGON2_PARAMS = { memoryKiB: 16384, iterations: 1, parallelism: 1, hashLength: 32 };
 
 async function stretch(password: string, salt: Uint8Array): Promise<Uint8Array> {
   const encoded = new TextEncoder().encode(password);
@@ -188,7 +188,8 @@ async function download(uploaded: Uploaded, password?: string): Promise<Uint8Arr
     expect(meta.name).toBe(`サンプル${file.index}.bin`);
 
     const blob = await SELF.fetch(
-      `${ORIGIN}/api/files/${uploaded.token}/files/${file.index}/blob?g=${encodeURIComponent(grant)}`,
+      `${ORIGIN}/api/files/${uploaded.token}/files/${file.index}/blob`,
+      { headers: { 'X-Grant': grant } },
     );
     expect(blob.status).toBe(200);
     const cipher = new Uint8Array(await blob.arrayBuffer());
@@ -412,8 +413,8 @@ describe('レンジ取得', () => {
     const { grant } = (await claimed.json()) as { grant: string };
 
     const response = await SELF.fetch(
-      `${ORIGIN}/api/files/${uploaded.token}/files/0/blob?g=${encodeURIComponent(grant)}`,
-      { headers: { Range: 'bytes=100-199' } },
+      `${ORIGIN}/api/files/${uploaded.token}/files/0/blob`,
+      { headers: { Range: 'bytes=100-199', 'X-Grant': grant } },
     );
     expect(response.status).toBe(206);
     expect(response.headers.get('content-range')).toBe(`bytes 100-199/${1000 + 16}`);

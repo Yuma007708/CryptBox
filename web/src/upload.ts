@@ -132,6 +132,17 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
     }
   };
 
+  // タブを閉じる・リロードするなどでページが離脱したら、アップロード中のセッションを
+  // 解放する。fetch は応答を待たずに送るため keepalive を付ける（sendBeacon は
+  // DELETE をサポートしないのでこちらを使う）。完了・中断後は不要になるので外す。
+  const onPageHide = () => {
+    void fetch(apiUrl(`/api/uploads/${encodeURIComponent(session.uploadToken)}`), {
+      method: 'DELETE',
+      keepalive: true,
+    }).catch(() => undefined);
+  };
+  window.addEventListener('pagehide', onPageHide);
+
   try {
     options.onStage('暗号化してアップロードしています…');
 
@@ -221,6 +232,7 @@ export async function uploadBundle(options: UploadOptions): Promise<UploadResult
     await abortSession();
     throw error;
   } finally {
+    window.removeEventListener('pagehide', onPageHide);
     await Promise.all(prepared.map((entry) => entry.file.close().catch(() => undefined)));
   }
 }

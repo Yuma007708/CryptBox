@@ -71,6 +71,16 @@ describe('purge(): reports の自動削除', () => {
     expect(await countReports()).toBe(0);
   });
 
+  it('保持期間切れかつ孤立の通報は二重に数えない', async () => {
+    const now = Date.now();
+    // 対応する bundles 行を作らない = 孤立、かつ保持期間も過ぎている
+    await insertReport('c'.repeat(64), 'malware', now - (DEFAULT_REPORT_RETENTION_DAYS + 1) * DAY_MS);
+
+    const result = await purge(env, now);
+    expect(result.reports).toBe(1);
+    expect(await countReports()).toBe(0);
+  });
+
   it('500 件を超える対象は 1 回の purge には持ち越される', async () => {
     const now = Date.now();
     const old = now - (DEFAULT_REPORT_RETENTION_DAYS + 1) * DAY_MS;
