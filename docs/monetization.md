@@ -26,6 +26,18 @@
   ページの `#` 以降（復号鍵）を広告側に渡さない。`Referrer-Policy: no-referrer` を維持する。
 - 最初はダミー枠でレイアウトだけ作り、ネットワークの審査が通ってから差し替える。
 
+### 広告を入れるときの CSP 制約（絶対に守る）
+
+- 広告は `<iframe sandbox="allow-scripts" src="別オリジン">` に限定する。同一オリジンで
+  広告 JS を読み込むと、復号鍵・平文を扱う本体スクリプトと同じ実行コンテキストに入る。
+  `sandbox` から `allow-same-origin` は付けない（付けると隔離が消える）。
+- **`script-src` は絶対に緩めない**。広告ネットワークのドメインを `script-src` に足すのは
+  「サーバーが鍵を盗む JS を配れる」というリスクを第三者にまで拡大する行為で、
+  `docs/security.md` の脅威モデルと矛盾する。
+- CSP に足してよいのは `frame-src` の広告オリジンのみ。`connect-src` / `img-src` も広げない
+  （広告が必要とするなら iframe の内側で完結させる）。
+- iframe の `src` に URL フラグメント（`#` 以降 = 復号鍵）やトークンを含めない。
+
 ## 濫用対策（公開前に必須）
 
 1. **Cloudflare Turnstile** をアップロード開始（`POST /api/uploads`）に要求する。

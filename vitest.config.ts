@@ -21,6 +21,14 @@ export default defineConfig({
                 GRANT_SECRET: 'test-grant-secret',
                 MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
               },
+              // 静的アセットのフォールバック経路（app.get('*')）を検証するための
+              // ダミー ASSETS。本番は Cloudflare Assets が同じ binding 名で入る
+              serviceBindings: {
+                ASSETS: () =>
+                  new Response('<!doctype html><title>dummy</title>', {
+                    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+                  }),
+              },
             },
           }),
         ],
@@ -126,6 +134,31 @@ export default defineConfig({
           }),
         ],
         test: { name: 'admin', include: ['test/abuse/admin.test.ts'] },
+      },
+      {
+        // GRANT_SECRET が短すぎる（= 署名が意味をなさない）構成を再現する結合テスト
+        plugins: [
+          cloudflareTest({
+            main: './src/index.ts',
+            miniflare: {
+              compatibilityDate: '2026-08-01',
+              d1Databases: ['DB'],
+              r2Buckets: ['BUCKET'],
+              bindings: {
+                GRANT_SECRET: 'short',
+                MAX_FILE_SIZE: String(5 * 1024 * 1024 * 1024),
+              },
+              // 設定不備でも静的アセットは配る（ガードは /api/* だけ）ことを検証するため
+              serviceBindings: {
+                ASSETS: () =>
+                  new Response('<!doctype html><title>dummy</title>', {
+                    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+                  }),
+              },
+            },
+          }),
+        ],
+        test: { name: 'grant-secret', include: ['test/abuse/grant-secret.test.ts'] },
       },
       {
         // workerd は実行時の WebAssembly.compile を禁じているため、

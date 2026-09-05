@@ -32,7 +32,7 @@ afterEach(() => {
 describe('Turnstile hostname 照合 (TURNSTILE_HOSTNAMES 設定時)', () => {
   it('hostname が許可リストに無ければ 403', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
-      Response.json({ success: true, hostname: 'evil.example.net' }),
+      Response.json({ success: true, action: 'upload', hostname: 'evil.example.net' }),
     );
     const response = await post(uploadBody());
     expect(response.status).toBe(403);
@@ -40,7 +40,7 @@ describe('Turnstile hostname 照合 (TURNSTILE_HOSTNAMES 設定時)', () => {
 
   it('hostname が許可リストにあれば通す', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
-      Response.json({ success: true, hostname: 'cryptbox.test' }),
+      Response.json({ success: true, action: 'upload', hostname: 'cryptbox.test' }),
     );
     const response = await post(uploadBody());
     expect(response.status).toBe(200);

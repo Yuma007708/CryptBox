@@ -17,6 +17,7 @@ beforeEach(async () => {
 interface FakeRenderOptions {
   sitekey: string;
   appearance: string;
+  action?: string;
   callback: (token: string) => void;
   'error-callback': () => void;
   'expired-callback'?: () => void;
@@ -27,8 +28,10 @@ function installFakeTurnstile() {
   const resetSpy = vi.fn();
   let captured: FakeRenderOptions | null = null;
   const api = {
-    render: vi.fn((_container: HTMLElement, options: FakeRenderOptions) => {
+    render: vi.fn((container: HTMLElement, options: FakeRenderOptions) => {
       captured = options;
+      // 実物の Turnstile は iframe を差し込む。remove() で消えることを検証するため模倣する。
+      container.append(document.createElement('iframe'));
       return 'widget-1';
     }),
     reset: resetSpy,
@@ -38,6 +41,7 @@ function installFakeTurnstile() {
   return {
     api,
     resetSpy,
+    options: () => captured!,
     fireToken: (token: string) => captured!.callback(token),
     fireError: () => captured!['error-callback'](),
     fireExpired: () => captured!['expired-callback']?.(),
@@ -108,6 +112,39 @@ describe('createTurnstileWidget', () => {
     const succeeding = widget.getToken();
     fake.fireToken('token-recovered');
     await expect(succeeding).resolves.toBe('token-recovered');
+  });
+
+  it("render に action:'upload' を渡す（サーバー側で siteverify の action を検証するため）", async () => {
+    const fake = installFakeTurnstile();
+    await createTurnstileWidget(document.createElement('div'), 'site-key');
+
+    expect(fake.options().action).toBe('upload');
+    expect(fake.options().sitekey).toBe('site-key');
+  });
+
+  it('remove() で turnstile.remove が呼ばれ、コンテナが空になる', async () => {
+    const fake = installFakeTurnstile();
+    const container = document.createElement('div');
+    const widget = await createTurnstileWidget(container, 'site-key');
+    expect(container.children.length).toBe(1);
+
+    widget.remove();
+
+    expect(fake.api.remove).toHaveBeenCalledWith('widget-1');
+    expect(container.children.length).toBe(0);
+  });
+
+  it('remove() は二重呼び出しでも 1 度しか撤去せず、以後 reset も呼ばない', async () => {
+    const fake = installFakeTurnstile();
+    const widget = await createTurnstileWidget(document.createElement('div'), 'site-key');
+
+    widget.remove();
+    widget.remove();
+    expect(fake.api.remove).toHaveBeenCalledTimes(1);
+
+    fake.resetSpy.mockClear();
+    await expect(widget.getToken()).rejects.toThrow();
+    expect(fake.resetSpy).not.toHaveBeenCalled();
   });
 
   it('expired-callback / timeout-callback は latest をクリアし widget を reset する', async () => {

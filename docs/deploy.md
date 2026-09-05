@@ -18,6 +18,37 @@ npx wrangler d1 create cryptbox
 npm run db:init     # src/schema.sql を本番 D1 に適用
 ```
 
+### 既存 D1 のマイグレーション
+
+`src/schema.sql` は `CREATE TABLE IF NOT EXISTS` だけで構成しているため、
+**既に運用中の D1 に対して列の追加は反映されません**。過去バージョンから更新する場合は、
+`npm run db:init` の後に 1 度だけ次を実行してください。
+
+```bash
+npm run db:migrate  # src/migrations/0001-security-audit.sql を本番 D1 に適用
+```
+
+> SQLite の `ALTER TABLE ... ADD COLUMN` は冪等ではありません。**既に列がある環境では
+> `duplicate column name` エラーになりますが、それは「適用済み」という意味なので無視して
+> 構いません。** 新規に `db:init` したデータベースには最初からすべての列があるため、
+> このマイグレーションを流す必要はありません。
+
+追加される列:
+
+- `bundles.disabled` … 削除処理はまずこの列を 1 にしてから R2 / D1 を消します。
+  R2 の削除が途中で失敗しても、`disabled = 1` の間は `/info` `/claim` `/blob` が
+  すべて 404 を返す（配信は止まったまま）ようになっています。
+  **この列が無いままコードだけを更新すると API は 500 を返して止まります**
+  （黙って配信停止チェックを素通りさせないための fail-closed です）。
+- `bundles.disabled_reason` … 物理削除が保留になったとき、cron の再削除が
+  正しい理由で削除レシートを書けるように保持します。
+- `uploads.ip_hash` … 同一 IP の同時アップロードセッション数を数えるための
+  鍵付きハッシュです。生の IP は保存しません。
+- `uploads.last_activity_at` … 最後にパートを受け取った時刻。無活動が続いた
+  セッションを同時オープン数の勘定から外す（利用者の自己ロックアウト防止）ために使います。
+- `grant_uses` テーブル（`/finish` の二重消費防止）と各インデックスは
+  `CREATE ... IF NOT EXISTS` なので `npm run db:init` だけで作成されます。
+
 ## 2. シークレット
 
 ```bash
@@ -49,8 +80,20 @@ npx wrangler secret put UPLOAD_TOKEN
    - ドメイン: 公開ホスト名（例: `cryptbox.example.com`）
    - ウィジェットモード: 任意（アプリ側は `appearance: 'interaction-only'` で明示的にレンダリングするため、
      Managed / Invisible のどちらでも動く）
-2. 発行された **サイトキー**（公開値）を `wrangler.jsonc` の `vars.TURNSTILE_SITE_KEY` に書き、
-   **`wrangler deploy` を完了させる**（`npm run deploy` でも可）。
+2. 発行された **サイトキー**（公開値）を設定し、**`wrangler deploy` を完了させる**
+   （`npm run deploy` でも可）。設定先は次のどちらか一方に統一してください。
+   - **`wrangler.jsonc` の `vars.TURNSTILE_SITE_KEY` に実値を書く**
+     （例: `"TURNSTILE_SITE_KEY": "0x4AAAAAAA..."`）。リポジトリに載る公開値なので秘匿は不要です。
+   - **Cloudflare ダッシュボード（Workers → Settings → Variables）で管理する**。
+     この場合は `wrangler.jsonc` の `vars` にキー自体を**書かない**でください。
+
+   > ⚠️ **`vars` に空文字を残さないこと。** `wrangler deploy` は `vars` を差分ではなく
+   > **このファイルの内容で丸ごと上書き**します。`"TURNSTILE_SITE_KEY": ""` を残したまま
+   > デプロイすると、ダッシュボードで設定したサイトキーがデプロイのたびに消え、
+   > 「シークレットはあるがサイトキーが無い」片肺状態（＝検証が黙ってスキップされる）に
+   > 戻ってしまいます。この状態を検知したとき、Worker は起動後 1 回だけ
+   > `console.error` で警告を出します（ログで確認できます）。
+   > そのため既定の `wrangler.jsonc` にはこのキーを置いていません。
 3. デプロイが終わってから **シークレット**を Worker に設定する:
 
 ```bash
@@ -60,10 +103,20 @@ npx wrangler secret put TURNSTILE_SECRET
 以降、`GET /api/config` が `turnstileSiteKey` を返すようになり、フロントエンドが自動で
 ウィジェットを読み込みます。`TURNSTILE_SECRET` を設定した瞬間からサーバー側の検証が有効になります。
 
-> **安全弁**: サーバー側は `TURNSTILE_SECRET` が設定されていても `TURNSTILE_SITE_KEY` が
-> 未設定なら検証をスキップします（サイトキーを配っていなければクライアントはそもそも
-> トークンを送れないため）。上記の順序を守れなくても送信不能にはなりませんが、
-> 検証は無効なままなので早めにサイトキーを設定してください。
+> ⚠️ **片肺構成は 503 で止まります（fail-closed）。** `TURNSTILE_SECRET` が設定されて
+> いるのに `TURNSTILE_SITE_KEY` が未設定だと、クライアントにサイトキーを配れず検証が
+> 成立しません。この状態で `POST /api/uploads` は **503**
+> （`{"error":"サーバーの設定が不完全です（Turnstile）"}`）を返し、起動後 1 回だけ
+> `console.error` に警告を出します。検証をスキップして通していた頃は
+> 「Turnstile を入れたつもりで実際は素通し」という状態が黙って続いてしまうため、
+> 送信を止めて運営者に気づかせる方針に変えました。
+>
+> そのため**手順の順序（サイトキー → シークレット）は必ず守ってください**。
+> 逆順にした・`vars` の空文字上書きでサイトキーが消えた場合、復旧は次のどちらかです。
+>
+> - `TURNSTILE_SITE_KEY` を設定して `wrangler deploy` し直す（本来の直し方）
+> - 急ぎで送信を復旧させたいだけなら `npx wrangler secret delete TURNSTILE_SECRET`
+>   （Turnstile 自体を無効に戻す。両方未設定なら従来どおり検証なしで通ります）
 
 > **fail-closed のトレードオフ**: Turnstile 検証は fail-closed（`challenges.cloudflare.com`
 > への通信が失敗・タイムアウトした場合も 403 を返す）です。Turnstile 自体が障害を起こすと
@@ -192,7 +245,9 @@ IP あたりのアップロード開始回数を [Workers Rate Limiting binding]
 
 ```jsonc
 "ratelimits": [
-  { "name": "UPLOAD_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+  { "name": "UPLOAD_LIMITER",   "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
+  { "name": "REPORT_LIMITER",   "namespace_id": "1002", "simple": { "limit": 5,  "period": 60 } },
+  { "name": "DOWNLOAD_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } }
 ]
 ```
 
@@ -205,11 +260,43 @@ IP あたりのアップロード開始回数を [Workers Rate Limiting binding]
   （対象パス `/api/uploads`、しきい値・期間は上と揃える、アクションは Block や
   Managed Challenge）。WAF のレート制限は Cloudflare のエッジで Worker を呼ぶ前に効くため、
   より安価に大量リクエストを弾けます。
-- **この binding が絞るのはセッション作成回数（`POST /api/uploads`）だけです。**
-  チャンクの PUT（`PUT /api/uploads/:token/files/:file/parts/:chunk`）や、
-  ダウンロード側の blob GET は絞りません。転送量そのもの（帯域・データ量）を制限したい場合は
-  `MAX_FILE_SIZE`（1 バンドルの合計サイズ上限）と、上記の WAF Rate limiting rules
-  （対象パスを転送系エンドポイントまで広げる）を別途設計してください。
+- `DOWNLOAD_LIMITER` は本体取得（`GET /api/files/:token/files/:file/blob`）を
+  IP あたり 300 回/分 に絞ります（429 応答には `Retry-After: 60` が付きます）。
+  受信側はチャンク単位（既定 5 MiB）で Range 取得を投げるため、60 回/分 では
+  300 MiB/分 ≒ 40 Mbps 程度で正常な受信まで止まってしまいます。
+  グラント 1 枚での大量取得を抑えつつ、まっとうな回線を邪魔しない目安です。
+  binding が無ければ制限しません。
+- `REPORT_LIMITER` は通報 API を絞ります。**binding が無い構成でも**、`reports` の行数が
+  50,000 に達した時点で通報 API は 503 を返します（D1 の無制限な肥大化を防ぐ最終防波堤）。
+- **チャンクの PUT（`PUT /api/uploads/:token/files/:file/parts/:chunk`）は回数では絞りません。**
+  代わりに、(1) 宣言 (`Content-Length`) と実バイト数の両方が期待値と一致しないパートは
+  400 で拒否し、(2) 同一 IP が同時に開けるアップロードセッションを 8 個までに制限し
+  （超過すると `POST /api/uploads` が 429）、(3) 未完了セッションは 2 時間
+  （`UPLOAD_TTL_MS`）で cron が R2 のマルチパートごと破棄します。
+  (2) は「直近 15 分以内に活動があった未完了セッション」だけを数えます（放棄された
+  セッションが枠を占有して利用者が自分自身を締め出すのを防ぐため）。また
+  `CF-Connecting-IP` が無い構成（Cloudflare を経由しないローカル実行など）では、
+  全員が同じキーに集約されて互いを締め出すのを避けるため上限を適用しません。
+- 転送量そのもの（帯域・データ量）を制限したい場合は `MAX_FILE_SIZE`（1 バンドルの合計サイズ上限）と、
+  上記の WAF Rate limiting rules（対象パスを転送系エンドポイントまで広げる）を別途設計してください。
+
+## ローカル開発時の CORS
+
+既定で CORS を許可するのは Capacitor アプリの WebView オリジン
+（`capacitor://localhost` / `https://localhost`）だけです。`http://localhost` は
+「同一マシンで動く任意のアプリ・任意のポート」を意味し、悪意あるローカルページから
+API を叩けてしまうため**既定から外しています**。
+
+`vite dev`（`http://localhost:5173` など）から本番・ステージングの API を直接叩いて
+開発したい場合は、`APP_ORIGINS` に明示的に足してください（カンマ区切り）。
+
+```jsonc
+"vars": {
+  "APP_ORIGINS": "http://localhost:5173"
+}
+```
+
+本番環境には設定しないでください（`npm run dev` の同一オリジン構成では不要です）。
 
 ## 7. 動作確認
 

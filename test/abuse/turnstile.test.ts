@@ -40,7 +40,7 @@ describe('Turnstile 検証 (TURNSTILE_SECRET 設定時)', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const url = typeof input === 'string' ? input : (input as Request).url;
       expect(url).toBe(SITEVERIFY_URL);
-      return Response.json({ success: true });
+      return Response.json({ success: true, action: 'upload' });
     });
 
     const response = await post(uploadBody({ turnstileToken: 'good-token' }));
@@ -58,7 +58,7 @@ describe('Turnstile 検証 (TURNSTILE_SECRET 設定時)', () => {
     let capturedBody = '';
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
       capturedBody = String(init?.body ?? '');
-      return Response.json({ success: true });
+      return Response.json({ success: true, action: 'upload' });
     });
 
     const response = await post(uploadBody({ turnstileToken: 'good-token' }), {
@@ -97,6 +97,20 @@ describe('Turnstile 検証 (TURNSTILE_SECRET 設定時)', () => {
   it('siteverify が 5xx (res.ok = false) を返せば 403', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(
       async () => new Response('internal error', { status: 500 }),
+    );
+    const response = await post(uploadBody({ turnstileToken: 'good-token' }));
+    expect(response.status).toBe(403);
+  });
+
+  it('siteverify 応答に action が無ければ 403（別用途のトークン使い回しを弾く）', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ success: true }));
+    const response = await post(uploadBody({ turnstileToken: 'good-token' }));
+    expect(response.status).toBe(403);
+  });
+
+  it('siteverify 応答の action が別の値なら 403', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      Response.json({ success: true, action: 'other' }),
     );
     const response = await post(uploadBody({ turnstileToken: 'good-token' }));
     expect(response.status).toBe(403);

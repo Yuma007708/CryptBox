@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ARGON2_DEFAULTS,
+  ARGON2_LIMITS,
   GCM_TAG_BYTES,
   chunkAad,
   chunkNonce,
@@ -8,6 +10,7 @@ import {
   fromBase64Url,
   toBase64Url,
   totalChunks,
+  validateArgon2Params,
 } from '../shared/format.js';
 
 describe('チャンク分割の算術', () => {
@@ -62,5 +65,54 @@ describe('base64url', () => {
   it('URL に安全な文字だけを使う', () => {
     const bytes = new Uint8Array([251, 255, 190, 239]);
     expect(toBase64Url(bytes)).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+});
+
+describe('validateArgon2Params', () => {
+  it('既定パラメータは有効', () => {
+    expect(validateArgon2Params(ARGON2_DEFAULTS)).toBe(true);
+  });
+
+  it('境界値ちょうどは有効', () => {
+    expect(
+      validateArgon2Params({
+        memoryKiB: ARGON2_LIMITS.memoryKiB.min,
+        iterations: ARGON2_LIMITS.iterations.min,
+        parallelism: ARGON2_LIMITS.parallelism.min,
+        hashLength: ARGON2_LIMITS.hashLength,
+      }),
+    ).toBe(true);
+    expect(
+      validateArgon2Params({
+        memoryKiB: ARGON2_LIMITS.memoryKiB.max,
+        iterations: ARGON2_LIMITS.iterations.max,
+        parallelism: ARGON2_LIMITS.parallelism.max,
+        hashLength: ARGON2_LIMITS.hashLength,
+      }),
+    ).toBe(true);
+  });
+
+  it('範囲を 1 でも外れれば無効', () => {
+    for (const patch of [
+      { memoryKiB: ARGON2_LIMITS.memoryKiB.min - 1 },
+      { memoryKiB: ARGON2_LIMITS.memoryKiB.max + 1 },
+      { iterations: ARGON2_LIMITS.iterations.min - 1 },
+      { iterations: ARGON2_LIMITS.iterations.max + 1 },
+      { parallelism: ARGON2_LIMITS.parallelism.min - 1 },
+      { parallelism: ARGON2_LIMITS.parallelism.max + 1 },
+      { hashLength: ARGON2_LIMITS.hashLength + 1 },
+    ]) {
+      expect(validateArgon2Params({ ...ARGON2_DEFAULTS, ...patch })).toBe(false);
+    }
+  });
+
+  it('型が違う・欠けていれば無効', () => {
+    expect(validateArgon2Params(null)).toBe(false);
+    expect(validateArgon2Params(undefined)).toBe(false);
+    expect(validateArgon2Params('memoryKiB=65536')).toBe(false);
+    expect(validateArgon2Params({})).toBe(false);
+    expect(validateArgon2Params({ ...ARGON2_DEFAULTS, memoryKiB: '65536' })).toBe(false);
+    expect(validateArgon2Params({ ...ARGON2_DEFAULTS, iterations: 3.5 })).toBe(false);
+    expect(validateArgon2Params({ ...ARGON2_DEFAULTS, memoryKiB: Number.NaN })).toBe(false);
   });
 });

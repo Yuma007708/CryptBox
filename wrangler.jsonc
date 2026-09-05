@@ -45,9 +45,14 @@
     "MAX_EXPIRY_HOURS": "168",
     // 広告枠（ダミー）の表示。"1" で有効。広告ネットワークは未接続で、レイアウトのみ
     "ADS_ENABLED": "0",
-    // Turnstile のサイトキー（公開値）。空ならクライアントは Turnstile を読み込まない。
-    // シークレットは `wrangler secret put TURNSTILE_SECRET` で別途設定する
-    "TURNSTILE_SITE_KEY": "",
+    // TURNSTILE_SITE_KEY はここに書かない。
+    // vars は wrangler deploy のたびにこのファイルの内容で「上書き」されるため、
+    // 空文字で置いておくと、ダッシュボードで設定したサイトキーがデプロイのたびに
+    // 消えて Turnstile の検証が黙ってスキップされる（片肺デプロイ）。
+    // 設定方法は docs/deploy.md「Turnstile」を参照:
+    //   - ダッシュボードで管理する（このファイルには書かない）か、
+    //   - ここに実際のサイトキーを書き切る（例: "TURNSTILE_SITE_KEY": "0x4AAA..."）
+    // のどちらかに統一すること。
     // 運営者名・連絡先（公開値）。GET /api/config で返す。空ならヘルプの節を省略する
     "OPERATOR_NAME": "",
     "OPERATOR_CONTACT": ""
@@ -68,6 +73,16 @@
       "name": "REPORT_LIMITER",
       "namespace_id": "1002",
       "simple": { "limit": 5, "period": 60 }
+    },
+    // GET /api/files/:token/files/:file/blob を IP あたり 300 回/分 に絞る。
+    // 受信側はチャンク単位（既定 5 MiB）で Range 取得を投げるため、60 回/分 では
+    // 300 MiB/分 = 40 Mbps 程度で正常な受信まで 429 で止まってしまう。
+    // 帯域の食い潰しを抑えつつ、まっとうな回線を邪魔しない目安として 300 回/分。
+    // 429 応答には Retry-After: 60 を付ける
+    {
+      "name": "DOWNLOAD_LIMITER",
+      "namespace_id": "1003",
+      "simple": { "limit": 300, "period": 60 }
     }
   ]
 }

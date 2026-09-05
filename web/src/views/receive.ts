@@ -11,6 +11,7 @@ import {
   finishDownloadBeacon,
   openBundle,
   pingDownload,
+  refreshGrant,
   reportBundle,
   WrongPassword,
   type BundleInfo,
@@ -22,7 +23,7 @@ import {
 import { createSaver, prepareServiceWorker, type Saver } from '../saver.js';
 import { keepAwake, shareFile } from '../native.js';
 import { isNative } from '../platform.js';
-import { fromBase64Url } from '../../../shared/format.js';
+import { LINK_SECRET_BYTES, fromBase64Url } from '../../../shared/format.js';
 import type { DeletionReceipt } from '../../../shared/receipt.js';
 import { renderReceiptCard } from '../receipt-ui.js';
 import { ApiError } from '../api.js';
@@ -74,6 +75,15 @@ export function renderReceive(root: HTMLElement, token: string): void {
     linkSecret = fromBase64Url(rawSecret);
   } catch {
     showError('復号鍵の形式が不正です。');
+    return;
+  }
+  // base64url として読めても長さが違えば別物（リンクの切れ・改変）。
+  // 短い鍵のまま導出を続けると、失敗の理由が「パスワード違い」に見えてしまう
+  if (linkSecret.length !== LINK_SECRET_BYTES) {
+    showError(
+      `復号鍵の長さが不正です（${LINK_SECRET_BYTES} バイトである必要があります）。` +
+        'リンクが途中で切れていないか確認してください。',
+    );
     return;
   }
 
@@ -270,13 +280,34 @@ export function renderReceive(root: HTMLElement, token: string): void {
     const fileButtons: HTMLButtonElement[] = [];
     const summaryRemaining = h('dd', {}, remainingText(info.remainingDownloads));
 
+    /**
+     * グラントが無ければ claim（回数を 1 消費）で取得する。
+     * 既にあり、残り時間が短くなってきた場合は refresh で延長する
+     * （claim と違って回数を消費しない）。refresh が 403/404 で失敗する
+     * ＝グラント自体が無効・リンクが失効しているということなので、
+     * claim へフォールバックせず（＝余計に回数を消費させず）エラーにする。
+     */
     const ensureGrant = async (): Promise<Claim> => {
-      if (grant && grant.grantExpiresAt > Date.now() + 60_000) return grant;
-      grant = await claim(token, authToken, opened.pwVerifier);
-      // ページを開いている間は生存信号を送り続ける。
-      // 回数上限に達したバンドルは、この信号が途絶えるとサーバー側で削除される
-      pingTimer ??= setInterval(() => void sendPing(), 60_000);
-      return grant;
+      if (!grant) {
+        grant = await claim(token, authToken, opened.pwVerifier);
+        // ページを開いている間は生存信号を送り続ける。
+        // 回数上限に達したバンドルは、この信号が途絶えるとサーバー側で削除される
+        pingTimer ??= setInterval(() => void sendPing(), 60_000);
+        return grant;
+      }
+
+      if (grant.grantExpiresAt > Date.now() + 10 * 60_000) return grant;
+
+      try {
+        const refreshed = await refreshGrant(token, authToken, grant.grant);
+        grant = { ...grant, grant: refreshed.grant, grantExpiresAt: refreshed.expiresAt };
+        return grant;
+      } catch (error) {
+        if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+          throw new Error('リンクの有効期限が切れました。ページを開き直してください');
+        }
+        throw error;
+      }
     };
 
     const sendPing = async (): Promise<void> => {

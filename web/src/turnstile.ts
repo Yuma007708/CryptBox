@@ -7,6 +7,8 @@
 interface TurnstileRenderOptions {
   sitekey: string;
   appearance: 'always' | 'execute' | 'interaction-only';
+  /** siteverify 応答に載る用途ラベル。サーバー側で `action === 'upload'` を検証する */
+  action: string;
   callback: (token: string) => void;
   'error-callback': () => void;
   'expired-callback': () => void;
@@ -51,6 +53,11 @@ function loadScript(): Promise<TurnstileApi> {
 export interface TurnstileWidget {
   /** 現在のトークンを取得し、次回に備えて自動でリセットする */
   getToken(): Promise<string>;
+  /**
+   * ウィジェットを DOM から撤去する。
+   * 復号鍵を画面に出す前に、外部 script 由来の DOM を必ず消すために呼ぶ。
+   */
+  remove(): void;
 }
 
 /** getToken() が待つ上限（ミリ秒）。Turnstile の自動リフレッシュ・初回発行を待つのに十分な余裕を持たせる */
@@ -80,9 +87,12 @@ export async function createTurnstileWidget(
     for (const waiter of pending) settle(waiter);
   };
 
+  let removed = false;
+
   const widgetId = turnstile.render(container, {
     sitekey: siteKey,
     appearance: 'interaction-only',
+    action: 'upload',
     callback: (token) => {
       latest = token;
       settleWaiters((waiter) => waiter.resolve(token));
@@ -92,11 +102,11 @@ export async function createTurnstileWidget(
     },
     'expired-callback': () => {
       latest = null;
-      turnstile.reset(widgetId);
+      if (!removed) turnstile.reset(widgetId);
     },
     'timeout-callback': () => {
       latest = null;
-      turnstile.reset(widgetId);
+      if (!removed) turnstile.reset(widgetId);
     },
   });
 
@@ -124,6 +134,7 @@ export async function createTurnstileWidget(
 
   return {
     async getToken(): Promise<string> {
+      if (removed) throw new Error('認証ウィジェットは既に閉じられています');
       try {
         if (latest !== null) {
           const token = latest;
@@ -133,8 +144,18 @@ export async function createTurnstileWidget(
         return await waitForToken();
       } finally {
         // 成功・失敗どちらでもリセットし、次回に備えて待ち合わせを作り直す
-        turnstile.reset(widgetId);
+        if (!removed) turnstile.reset(widgetId);
       }
+    },
+    remove(): void {
+      if (removed) return;
+      removed = true;
+      latest = null;
+      settleWaiters((waiter) =>
+        waiter.reject(new Error('認証ウィジェットが閉じられました')),
+      );
+      turnstile.remove(widgetId);
+      container.replaceChildren();
     },
   };
 }
